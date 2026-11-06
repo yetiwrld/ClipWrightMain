@@ -135,11 +135,39 @@ export function installedModels(): LocalModel[] {
   })
 }
 
+/**
+ * Resolve a model id to a file on disk.
+ *
+ * Accepts every name the model can be called by, because the three places that
+ * pass one in disagree:
+ *   • the download catalogue uses ids like `ggml-base.en`,
+ *   • `settings.transcription.defaultModel` defaults to `base.en`,
+ *   • a transcript may name the file itself (`ggml-base.en.bin`).
+ * Only matching the id made "Download base.en model" succeed and transcription
+ * then fail with "No speech model found for base.en" — the file was there, the
+ * lookup was wrong.
+ */
 export function modelPath(id: string): string | null {
-  const def = MODEL_CATALOGUE.find((m) => m.id === id)
-  if (!def) return null
-  const file = path.join(modelsDir(), def.filename)
-  return fs.existsSync(file) ? file : null
+  const wanted = id.trim().toLowerCase()
+  const stripped = wanted.replace(/^ggml-/, '').replace(/\.bin$/, '')
+  const matches = MODEL_CATALOGUE.filter((m) => {
+    const filename = m.filename.toLowerCase()
+    const bare = filename.replace(/^ggml-/, '').replace(/\.bin$/, '')
+    return (
+      m.id.toLowerCase() === wanted ||
+      filename === wanted ||
+      bare === stripped ||
+      m.id.toLowerCase().replace(/^ggml-/, '') === stripped
+    )
+  })
+  for (const def of matches) {
+    const file = path.join(modelsDir(), def.filename)
+    if (fs.existsSync(file)) return file
+  }
+  // Not in the catalogue under that name: accept any ggml file with that name in
+  // the workspace, so a hand-copied model still works.
+  const direct = path.join(modelsDir(), `ggml-${stripped}.bin`)
+  return fs.existsSync(direct) ? direct : null
 }
 
 export function deleteModel(id: string): boolean {
@@ -420,6 +448,25 @@ async function probeHttpModels(baseUrl: string, pathname: string): Promise<{ ok:
 }
 
 /** Search the usual model folders for a `ggml-*.bin` the user already has. */
+/**
+ * Any whisper model already on this PC, quoted so the UI can say which one.
+ * Order: the workspace's own Models folder, then the bundled folder, then the
+ * usual places a whisper.cpp download ends up.
+ */
+export function findAnyLocalWhisperModel(): { path: string; name: string } | undefined {
+  const own = modelsDir()
+  try {
+    const found = fs
+      .readdirSync(own)
+      .filter((f) => f.toLowerCase().startsWith('ggml-') && f.toLowerCase().endsWith('.bin'))
+      .sort((a, b) => a.localeCompare(b))[0]
+    if (found) return { path: path.join(own, found), name: found }
+  } catch {
+    /* no folder yet */
+  }
+  return findExistingWhisperModel()
+}
+
 export function findExistingWhisperModel(): { path: string; name: string } | undefined {
   const dirs: string[] = []
   const push = (dir: string | undefined) => {

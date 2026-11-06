@@ -6,6 +6,7 @@
  */
 import { useEffect, useRef } from 'react'
 import { useEditor } from '../state/editor'
+import { timelineEnd } from '../state/playback'
 
 export function usePlayback(enabled = true): void {
   const playing = useEditor((s) => s.playing)
@@ -39,6 +40,21 @@ export function usePlayback(enabled = true): void {
   useEffect(() => {
     if (!playing || !enabled) return
     lastRef.current = performance.now()
+
+    /*
+     * Pressing play while parked at (or past) the end used to do nothing: the
+     * clock computed `playhead + delta >= end` on its first frame and turned
+     * playback straight back off. The playhead is usually left exactly at the
+     * end after any finished playback, so every later play attempt silently
+     * failed — which is what "it played once, then it would not play again"
+     * looks like. Playing from the end now restarts from the beginning.
+     */
+    {
+      const state = useEditor.getState()
+      const end = timelineEnd(state.project)
+      if (end > 0 && state.playhead >= end - 1) setPlayhead(0, { snap: false })
+    }
+
     const tick = (now: number) => {
       // Clamp the delta: a long frame (window drag, GC pause, hidden tab) must
       // not turn into a visible jump of the playhead.
@@ -50,7 +66,7 @@ export function usePlayback(enabled = true): void {
         setPlaying(false)
         return
       }
-      const end = project.clips.reduce((m, c) => Math.max(m, c.start + c.duration), 0)
+      const end = timelineEnd(project)
       // Nothing to play: stop rather than looping on a zero-length timeline.
       if (end <= 0) {
         setPlaying(false)

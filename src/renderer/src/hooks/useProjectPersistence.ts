@@ -72,10 +72,29 @@ export function useGlobalShortcuts(handlers: Record<string, () => void>): void {
   useEffect(() => {
     const run = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null
-      const inField =
+      /*
+       * Only real *text* entry swallows shortcuts. Every other focused control —
+       * buttons, selects, switches, sliders, checkboxes — must not, because the
+       * user expects Space to play/pause "anywhere in the video editor". A slider
+       * or button keeps its own behaviour on Enter; Space belongs to playback.
+       */
+      const textEntry =
         target &&
-        (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
-      const key = event.key
+        ((target.tagName === 'INPUT' &&
+          !['range', 'checkbox', 'radio', 'button', 'submit', 'color', 'file'].includes(
+            (target as HTMLInputElement).type
+          )) ||
+          target.tagName === 'TEXTAREA' ||
+          target.isContentEditable)
+      const inField = Boolean(textEntry)
+      /*
+       * The space bar reports event.key === ' ' (and 'Spacebar' on old WebKit),
+       * never 'Space'. The shortcut map is keyed 'Space', so looking the raw key
+       * up meant the global Space handler could never fire: playback only ever
+       * toggled when the preview button itself had focus. Normalise first.
+       */
+      const rawKey = event.key
+      const key = rawKey === ' ' || rawKey === 'Spacebar' ? 'Space' : rawKey
       const mod = event.ctrlKey || event.metaKey
       const combo = `${mod ? 'Ctrl+' : ''}${event.shiftKey ? 'Shift+' : ''}${key}`
       const map: Record<string, string> = {
@@ -111,6 +130,12 @@ export function useGlobalShortcuts(handlers: Record<string, () => void>): void {
         '?': 'help'
       }
       if (inField && !['Escape', 'Ctrl+s'].includes(combo)) return
+      // A modified key that is not itself a shortcut must not fall through to the
+      // bare-key binding (Ctrl+Space is not play/pause, and Ctrl+Delete is not a
+      // plain delete).
+      if (mod && !map[combo]) return
+      // preventDefault() also stops the browser from clicking a focused button
+      // when Space is pressed, so play/pause always wins over a stray activation.
       const action = map[combo] ?? map[key]
       if (!action || !handlers[action]) return
       event.preventDefault()

@@ -17,6 +17,7 @@ import {
   VolumeX
 } from 'lucide-react'
 import { useEditor } from '../state/editor'
+import { togglePlayback } from '../state/playback'
 import { IconButton } from './ui'
 import { formatTimecode } from '@shared/time'
 import { drawScene, layerBounds } from '../lib/preview-canvas'
@@ -346,7 +347,7 @@ export function PreviewMonitor(): JSX.Element {
           <IconButton label="Previous frame" onClick={() => stepFrame(-1)}>
             <RotateCcw size={13} style={{ transform: 'scaleX(-1)' }} />
           </IconButton>
-          <IconButton label={playing ? 'Pause' : 'Play'} active={playing} onClick={() => setPlaying(!playing)}>
+          <IconButton label={playing ? 'Pause' : 'Play'} active={playing} onClick={() => togglePlayback()}>
             {playing ? <Pause size={16} /> : <Play size={16} />}
           </IconButton>
           <IconButton label="Next frame" onClick={() => stepFrame(1)}>

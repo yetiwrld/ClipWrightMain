@@ -15,7 +15,7 @@ import { spawn } from 'node:child_process'
 import { ffmpegPath } from '../ffmpeg/locate'
 import { runProcess } from '../ffmpeg/runner'
 import { modelsDir, workspaceLayout } from '../workspace'
-import { modelPath, whisperRuntimePath, findExistingWhisperModel } from './models'
+import { modelPath, whisperRuntimePath, findAnyLocalWhisperModel } from './models'
 import { providerStore, transcribeRemote } from './providers'
 import { estimateWordTimings } from '@shared/captions'
 import type { Transcript, TranscriptSegment, TranscriptWord } from '@shared/types'
@@ -90,17 +90,31 @@ export async function transcribe(opts: TranscribeOptions): Promise<Transcript> {
 async function transcribeLocal(opts: TranscribeOptions, wav: string): Promise<Transcript> {
   const runtime = whisperRuntimePath()
   const wantedModel = opts.model ?? settingsStore().get().transcription.defaultModel
-  // Prefer the model the user asked for, then any model in the workspace, then any
-  // ggml model already on this PC (e.g. one sitting in whisper.cpp/models).
-  const modelFile = modelPath(wantedModel) ?? findAnyWhisperModel() ?? findExistingWhisperModel()?.path
+  /*
+   * Any real model beats a missing specific one. Order:
+   *   1. the model that was asked for (by id, filename or basename),
+   *   2. any ggml file in the workspace Models folder,
+   *   3. any ggml file already on this PC (whisper.cpp\models, ~/.cache/…).
+   * Before, `modelPath('base.en')` returned null even though ggml-base.en.bin had
+   * just been downloaded (ids and filenames differ), so transcription failed on a
+   * machine that was fully set up.
+   */
+  const resolved = modelPath(wantedModel)
+  const fallback = resolved ? null : (findAnyLocalWhisperModel()?.path ?? findAnyWhisperModel() ?? null)
+  const modelFile = resolved ?? fallback
   if (!runtime) {
     throw new Error(
       'Local transcription needs a whisper.cpp binary. Put whisper-cli.exe (with its DLLs) next to the app, in Documents\\Clipwright Studio\\Tools, or anywhere on your PATH, then press “Re-scan this PC” in Settings → Local AI models.'
     )
   }
   if (!modelFile) {
+    // Say what is missing for *whisper.cpp*, because the model people already
+    // have is often a faster-whisper `model.bin` from a HuggingFace cache, which
+    // this runtime cannot read.
     throw new Error(
-      `No speech model found for "${wantedModel}". Download one in Settings → Local AI models, or point Clipwright at an existing ggml-*.bin by placing it in Documents\\Clipwright Studio\\Models.`
+      `whisper.cpp has no model file. "${wantedModel}" is not installed and no ggml-*.bin was found. ` +
+        'Open AI ▸ Transcript and press "Download base.en model" (one click, 142 MB), or copy an existing ggml-*.bin into ' +
+        'Documents\\Clipwright Studio\\Models. Note that a faster-whisper "model.bin" from a HuggingFace cache cannot be used by whisper.cpp.'
     )
   }
 

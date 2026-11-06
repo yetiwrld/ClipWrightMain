@@ -25,6 +25,7 @@ import { useEditor, useTimelineActions } from './state/editor'
 import { useApp } from './state/app'
 import { openProject, useAutosave, useGlobalShortcuts } from './hooks/useProjectPersistence'
 import { usePlayback } from './hooks/usePlayback'
+import { togglePlayback } from './state/playback'
 import { Button, IconButton, Modal, Tabs } from './components/ui'
 import { PreviewMonitor } from './components/PreviewMonitor'
 import { Timeline } from './components/Timeline'
@@ -318,10 +319,12 @@ export default function App(): JSX.Element {
       duplicate: () => actions.duplicateSelected(),
       delete: () => actions.deleteSelected(false),
       rippleDelete: () => actions.deleteSelected(true),
-      playPause: () => {
-        const state = useEditor.getState()
-        state.setPlaying(!state.playing)
-      },
+      /*
+       * Space must start and stop playback from anywhere in the editor, so the
+       * shortcut shares one implementation with the transport button instead of
+       * re-deriving the rules here (see state/playback.ts).
+       */
+      playPause: () => togglePlayback(),
       escape: () => {
         useEditor.getState().clearSelection()
         setHelpOpen(false)
