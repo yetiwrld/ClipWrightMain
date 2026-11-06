@@ -47,6 +47,11 @@ jobs:
       - name: Build (catches import/bundling mistakes that types miss)
         run: npm run build
 
+      # The packaged app is only useful if it can find what the user installed.
+      # These run the real search code against the runner's filesystem.
+      - name: Runtime detection smoke (whisper search + Ollama API)
+        run: npx vitest run tests/runtimes.test.ts tests/startup.test.ts
+
       - name: Assemble a resources folder from the installed ffmpeg
         shell: pwsh
         run: |
