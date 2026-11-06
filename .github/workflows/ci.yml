@@ -119,8 +119,29 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install ffmpeg (fallback source for the bundled binaries)
+        run: |
+          choco install ffmpeg -y --no-progress
+          ffmpeg -version
+
       - name: Fetch ffmpeg + whisper.cpp binaries
-        run: node scripts/fetch-binaries.mjs
+        id: binaries
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node scripts/fetch-binaries.mjs 2>&1 | Tee-Object -FilePath binaries.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Report a binary fetch failure
+        if: steps.binaries.outcome == 'failure'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tail = if (Test-Path binaries.log) { (Get-Content binaries.log -Tail 60) -join "`n" } else { 'no log' }
+          "Binary fetch failed for ``$($env:GITHUB_SHA.Substring(0,7))``.`n`n``````n$tail`n``````" | Set-Content body.md
+          gh api -X POST "repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA/comments" -F body=@body.md
+          exit 1
 
       - name: Generate icons from the logo
         run: node scripts/make-icons.mjs

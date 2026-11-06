@@ -74,32 +74,94 @@ function findFile(dir, name) {
   return null
 }
 
+/**
+ * Last resort: use a real ffmpeg already installed on the machine (CI runners
+ * have one). Never resolves a package-manager *shim* — those are a few hundred
+ * KB and only work from their original location, which is exactly the trap that
+ * makes a "bundled binary" useless on a clean machine.
+ */
+function localBinary(name) {
+  const exe = process.platform === 'win32' ? `${name}.exe` : name
+  const roots = [
+    ...(process.env.PATH ?? '').split(path.delimiter).filter(Boolean),
+    'C:\\ProgramData\\chocolatey\\lib'
+  ]
+  for (const dir of roots) {
+    if (!fs.existsSync(dir)) continue
+    const stack = [dir]
+    while (stack.length) {
+      const current = stack.pop()
+      let entries = []
+      try {
+        entries = fs.readdirSync(current, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const entry of entries) {
+        const full = path.join(current, entry.name)
+        if (entry.isDirectory()) {
+          if (stack.length < 4000) stack.push(full)
+        } else if (entry.name.toLowerCase() === exe.toLowerCase()) {
+          const size = fs.statSync(full).size
+          if (size > 5 * 1_048_576) return full
+        }
+      }
+    }
+  }
+  return null
+}
+
+async function installFromLocal() {
+  log('falling back to an ffmpeg already installed on this machine')
+  for (const exe of ['ffmpeg.exe', 'ffprobe.exe']) {
+    const found = localBinary(exe.replace(/\.exe$/i, ''))
+    if (!found) throw new Error(`no real ${exe} found locally either — cannot build a working app`)
+    fs.copyFileSync(found, path.join(ffmpegDir, exe))
+    log(`installed resources/ffmpeg/${exe} from ${found} (${(fs.statSync(found).size / 1_048_576).toFixed(1)} MB)`)
+  }
+  fs.writeFileSync(
+    path.join(ffmpegDir, 'BUILD.txt'),
+    `source: locally installed ffmpeg on the build machine\nfetched: ${new Date().toISOString()}\n` +
+      `note: upstream download was unavailable; this build bundles the builder's ffmpeg.\n`
+  )
+}
+
 async function main() {
   const skipWhisper = process.argv.includes('--skip-whisper')
   const work = path.join(root, '.downloads')
   fs.mkdirSync(work, { recursive: true })
+  fs.mkdirSync(ffmpegDir, { recursive: true })
+  fs.mkdirSync(binDir, { recursive: true })
 
   /* ------------------------------- ffmpeg ------------------------------- */
-  const ffmpegZip = path.join(work, 'ffmpeg.zip')
-  const ffmpegDigest = await download(FFMPEG_URL, ffmpegZip)
-  const expectedFfmpeg = process.env.FFMPEG_SHA256
-  if (expectedFfmpeg && expectedFfmpeg.toLowerCase() !== ffmpegDigest) {
-    throw new Error(`ffmpeg checksum mismatch: expected ${expectedFfmpeg}, got ${ffmpegDigest}`)
-  }
-  const ffmpegExtract = path.join(work, 'ffmpeg')
-  unzip(ffmpegZip, ffmpegExtract)
-  for (const exe of ['ffmpeg.exe', 'ffprobe.exe']) {
-    const found = findFile(ffmpegExtract, exe)
-    if (!found) throw new Error(`${exe} not found inside the ffmpeg archive`)
-    fs.copyFileSync(found, path.join(ffmpegDir, exe))
-    log(`installed resources/ffmpeg/${exe} (${(fs.statSync(found).size / 1_048_576).toFixed(1)} MB)`)
+  let ffmpegDigest = ''
+  try {
+    const ffmpegZip = path.join(work, 'ffmpeg.zip')
+    ffmpegDigest = await download(FFMPEG_URL, ffmpegZip)
+    const expectedFfmpeg = process.env.FFMPEG_SHA256
+    if (expectedFfmpeg && expectedFfmpeg.toLowerCase() !== ffmpegDigest) {
+      throw new Error(`ffmpeg checksum mismatch: expected ${expectedFfmpeg}, got ${ffmpegDigest}`)
+    }
+    const ffmpegExtract = path.join(work, 'ffmpeg')
+    unzip(ffmpegZip, ffmpegExtract)
+    for (const exe of ['ffmpeg.exe', 'ffprobe.exe']) {
+      const found = findFile(ffmpegExtract, exe)
+      if (!found) throw new Error(`${exe} not found inside the ffmpeg archive`)
+      fs.copyFileSync(found, path.join(ffmpegDir, exe))
+      log(`installed resources/ffmpeg/${exe} (${(fs.statSync(found).size / 1_048_576).toFixed(1)} MB)`)
+    }
+  } catch (error) {
+    log(`WARNING: could not download ffmpeg (${error.message})`)
+    await installFromLocal()
   }
   // Record what we shipped so the app can report the exact build.
-  fs.writeFileSync(
-    path.join(ffmpegDir, 'BUILD.txt'),
-    `source: ${FFMPEG_URL}\nsha256(zip): ${ffmpegDigest}\nfetched: ${new Date().toISOString()}\n` +
-      `note: Gyan "essentials" build — LGPL/GPL components as per upstream licence.\n`
-  )
+  if (ffmpegDigest) {
+    fs.writeFileSync(
+      path.join(ffmpegDir, 'BUILD.txt'),
+      `source: ${FFMPEG_URL}\nsha256(zip): ${ffmpegDigest}\nfetched: ${new Date().toISOString()}\n` +
+        `note: Gyan "essentials" build — LGPL/GPL components as per upstream licence.\n`
+    )
+  }
 
   /* ------------------------------ whisper.cpp ------------------------------ */
   if (!skipWhisper) {
