@@ -90,6 +90,15 @@ function createWindow(): BrowserWindow {
   })
   win.webContents.on('render-process-gone', (_event, details) => {
     log.error('renderer', `render process gone: ${details.reason} (exit ${details.exitCode})`)
+    if (details.reason !== 'clean-exit') {
+      // Without this the process can outlive its window and look like "nothing
+      // opened" (a second launch would then also bail out on the instance lock).
+      dialog.showErrorBox(
+        'Clipwright Studio stopped',
+        `The window closed unexpectedly (${details.reason}).\n\nDetails were written to:\n${log.path()}`
+      )
+      app.exit(1)
+    }
   })
 
   // CI: `CLIPWRIGHT_SMOKE=1` makes the packaged app boot, verify the *UI actually
@@ -168,7 +177,20 @@ function createWindow(): BrowserWindow {
   return win
 }
 
-app.whenReady().then(async () => {
+app.whenReady().then(boot).catch((error: unknown) => {
+  const message = error instanceof Error ? (error.stack ?? error.message) : String(error)
+  log.error('app', `startup failed: ${message}`)
+  process.stderr.write(`Clipwright Studio failed to start: ${message}\n`)
+  // A silent exit is indistinguishable from "the program is broken". Say what
+  // happened and where the log is.
+  dialog.showErrorBox(
+    'Clipwright Studio could not start',
+    `Something went wrong while starting up.\n\n${message}\n\nDetails: ${log.path()}`
+  )
+  app.exit(1)
+})
+
+async function boot(): Promise<void> {
   log.info('app', `starting ${APP_NAME} ${app.getVersion()} on ${process.platform}/${process.arch}`)
 
   // Media protocol: only allow files inside the workspace or explicitly opened paths.
@@ -229,7 +251,7 @@ app.whenReady().then(async () => {
       }
     }, 8000)
   }
-})
+}
 
 app.on('window-all-closed', () => {
   killAll()
