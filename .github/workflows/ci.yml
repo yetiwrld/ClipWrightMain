@@ -170,16 +170,39 @@ jobs:
 
       - name: Smoke-test the packaged app (boot + real export)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 1. Boot the actual exe and prove the *UI rendered* (not merely that the
+          #    document loaded — a blank window passes that weaker check).
           $env:CLIPWRIGHT_SMOKE = '1'
           $proc = Start-Process -FilePath 'release/win-unpacked/Clipwright Studio.exe' -PassThru
-          if (-not $proc.WaitForExit(120000)) { $proc.Kill(); throw 'the packaged app never finished loading' }
+          if (-not $proc.WaitForExit(180000)) { $proc.Kill(); throw 'the packaged app never finished loading' }
           $proc.Refresh()
           $code = $proc.ExitCode
-          Remove-Item Env:\CLIPWRIGHT_SMOKE
+          Remove-Item Env:CLIPWRIGHT_SMOKE
           Get-Process | Where-Object { $_.ProcessName -like '*Clipwright*' } | Stop-Process -Force -ErrorAction SilentlyContinue
-          if ($code -ne 0) { throw "packaged app failed to boot (exit code $code)" }
-          Write-Host 'packaged app booted'
+
+          # The app writes its own diagnostics; print them so a failure is legible
+          # in the Actions log *and* in a commit comment.
+          $logFile = Get-ChildItem "$env:APPDATA\Clipwright Studio" -Recurse -Filter 'clipwright.log' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $lines = @()
+          if ($logFile) {
+            $lines = Get-Content $logFile.FullName -Tail 60
+            $lines | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) {
+              $body = "Packaged app failed to start on Windows (exit $code).`n`n``````n$($lines -join "`n")`n``````"
+              $body | Set-Content boot-body.md
+              gh api -X POST "repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA/comments" -F body=@boot-body.md
+            }
+          } else {
+            Write-Host 'no clipwright.log was produced by the app'
+          }
+          if ($code -ne 0) { throw "packaged app failed to start (exit code $code)" }
+          Write-Host 'packaged app booted and rendered its UI'
+
+          # 2. Render a real video through the real compositor with the bundled ffmpeg.
           node scripts/smoke-render.mjs --resources release/win-unpacked/resources --out $env:RUNNER_TEMP/smoke.mp4
 
       - name: Checksums

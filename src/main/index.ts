@@ -77,33 +77,64 @@ function createWindow(): BrowserWindow {
     }
   })
 
-  // CI: `CLIPWRIGHT_SMOKE=1` makes the packaged app boot, report that the
-  // renderer loaded, and exit. Exit code 0 means the real exe started and its
-  // bundle is intact; anything else fails the build.
+  // Always surface renderer problems in the log: a packaged app that shows a
+  // blank window is impossible to diagnose from the outside otherwise.
+  win.webContents.on('console-message', (_event, level, message, line, source) => {
+    if (level >= 2) log.warn('renderer', `${message} (${source}:${line})`)
+  })
+  win.webContents.on('preload-error', (_event, preloadPath, error) => {
+    log.error('preload', `${preloadPath}: ${error.message}`)
+  })
+  win.webContents.on('did-fail-load', (_event, code, description, url) => {
+    log.error('renderer', `failed to load ${url}: ${code} ${description}`)
+  })
+  win.webContents.on('render-process-gone', (_event, details) => {
+    log.error('renderer', `render process gone: ${details.reason} (exit ${details.exitCode})`)
+  })
+
+  // CI: `CLIPWRIGHT_SMOKE=1` makes the packaged app boot, verify the *UI actually
+  // rendered* (not just that the document loaded) and exit with that status.
+  // `did-finish-load` alone is not enough: a blocked or broken bundle still fires
+  // it, which is exactly the failure mode that produces a blank window.
   if (process.env.CLIPWRIGHT_SMOKE === '1') {
-    const timer = setTimeout(
-      () => {
-        log.error('smoke', 'renderer did not load within 60s')
-        app.exit(1)
-      },
-      60_000
-    )
-    win.webContents.once('did-finish-load', () => {
-      setTimeout(() => {
-        clearTimeout(timer)
-        log.info('smoke', `packaged app booted (${APP_NAME} ${app.getVersion()})`)
-        app.exit(0)
-      }, 1500)
-    })
-    win.webContents.once('did-fail-load', (_e, code, description) => {
+    const finish = (code: number, message: string) => {
+      if (code === 0) log.info('smoke', message)
+      else log.error('smoke', message)
       clearTimeout(timer)
-      log.error('smoke', `renderer failed to load: ${code} ${description}`)
-      app.exit(1)
+      app.exit(code)
+    }
+    const timer = setTimeout(() => finish(1, 'renderer never rendered the UI within 60s'), 60_000)
+
+    win.webContents.once('did-fail-load', (_event, code, description) => {
+      finish(1, `renderer failed to load: ${code} ${description}`)
     })
-    win.webContents.on('render-process-gone', (_e, details) => {
-      clearTimeout(timer)
-      log.error('smoke', `render process gone: ${details.reason}`)
-      app.exit(1)
+    win.webContents.once('render-process-gone', (_event, details) => {
+      finish(1, `render process gone: ${details.reason}`)
+    })
+
+    win.webContents.once('did-finish-load', async () => {
+      try {
+        // Wait for React to commit something into #root, then confirm the window
+        // is actually on screen — the two things a user would notice.
+        const probe = await win.webContents.executeJavaScript(`
+          new Promise((resolve) => {
+            const started = Date.now()
+            const check = () => {
+              const root = document.getElementById('root')
+              const text = (root && root.innerText) || ''
+              if (text.trim().length > 20) { resolve({ ok: true, chars: text.trim().length }); return }
+              if (Date.now() - started > 20000) { resolve({ ok: false, chars: text.trim().length }); return }
+              setTimeout(check, 250)
+            }
+            check()
+          })
+        `)
+        if (!probe.ok) return finish(1, `window is blank: #root has ${probe.chars} characters of text`)
+        if (!win.isVisible()) return finish(1, 'window never became visible')
+        finish(0, `UI rendered (${probe.chars} characters) and the window is visible`)
+      } catch (error) {
+        finish(1, `could not inspect the renderer: ${String(error)}`)
+      }
     })
   }
 

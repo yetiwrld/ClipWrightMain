@@ -25,9 +25,24 @@ export class SettingsStore extends EventEmitter {
     try {
       parsed = JSON.parse(fs.readFileSync(this.file, 'utf8')) as Partial<Settings>
     } catch {
+      // Missing file (first run) or unreadable/corrupt JSON: keep the file for
+      // diagnosis and fall back to defaults rather than refusing to start.
+      if (fs.existsSync(this.file)) {
+        try {
+          fs.renameSync(this.file, `${this.file}.corrupt`)
+        } catch {
+          /* ignore */
+        }
+      }
       parsed = {}
     }
     const merged = deepMerge(structuredClone(DEFAULT_SETTINGS), parsed)
+    // A hand-edited or half-written file can null out a whole section; restore any
+    // that ended up missing, so startup code can trust these objects.
+    const record = merged as unknown as Record<string, unknown>
+    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+      if (!record[key] || typeof record[key] !== typeof value) record[key] = structuredClone(value)
+    }
     if (!merged.storage.workspaceRoot) merged.storage.workspaceRoot = defaultWorkspaceRoot()
     if (!merged.export.outputDir) merged.export.outputDir = path.join(merged.storage.workspaceRoot, 'Exports')
     return merged
