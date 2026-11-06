@@ -81,6 +81,18 @@ export function pickInstallerAsset<T extends { name: string }>(assets: T[]): T |
   )
 }
 
+/**
+ * Choose the checksum file that can verify the installer.
+ *
+ * CI publishes `checksums.txt`; older builds published `.sha256` or
+ * `checksums.json`. If none is recognised the download completes but cannot be
+ * verified, so the app refuses to run it and the user is sent to the release
+ * page — a working update turns into a manual one.
+ */
+export function pickChecksumAsset<T extends { name: string }>(assets: T[]): T | undefined {
+  return assets.find((a) => /(checksum|sha)/i.test(a.name) && /(\.sha256|\.txt|\.json)$/i.test(a.name))
+}
+
 export async function checkForUpdates(manual = false): Promise<UpdateInfo> {
   const channel = settingsStore().get().updates.channel
   const current = currentVersion()
@@ -104,7 +116,7 @@ export async function checkForUpdates(manual = false): Promise<UpdateInfo> {
      * exists at all, so the user is never offered nothing.
      */
     const installer = pickInstallerAsset(latest.assets)
-    const checksumAsset = latest.assets.find((a) => /\.sha256$|checksums\.json$/i.test(a.name))
+    const checksumAsset = pickChecksumAsset(latest.assets)
     const available = compareVersions(latest.tag_name, current) > 0
     const info: UpdateInfo = {
       currentVersion: current,

@@ -193,3 +193,32 @@ describe('in-app update asset selection', () => {
     expect(pickInstallerAsset(assets)?.browser_download_url).toBe('u1')
   })
 })
+
+describe('update checksum asset', () => {
+  it('recognises the checksums.txt that CI actually publishes', async () => {
+    const { pickChecksumAsset } = await import('../src/main/updater')
+    const assets = [
+      { name: 'Clipwright-Studio-Setup-1.0.2-x64.exe', browser_download_url: 'setup', size: 1 },
+      { name: 'latest.yml', browser_download_url: 'yml', size: 1 },
+      { name: 'checksums.txt', browser_download_url: 'sums', size: 1 }
+    ]
+    // Without this the update downloads fine but cannot be verified, so the app
+    // refuses to install it and the user is sent to the release page instead.
+    expect(pickChecksumAsset(assets)?.browser_download_url).toBe('sums')
+  })
+
+  it('still accepts .sha256 and checksums.json from older releases', async () => {
+    const { pickChecksumAsset } = await import('../src/main/updater')
+    expect(
+      pickChecksumAsset([{ name: 'build.sha256', browser_download_url: 'a', size: 1 }])?.browser_download_url
+    ).toBe('a')
+    expect(
+      pickChecksumAsset([{ name: 'checksums.json', browser_download_url: 'b', size: 1 }])?.browser_download_url
+    ).toBe('b')
+  })
+
+  it('ignores unrelated text assets', async () => {
+    const { pickChecksumAsset } = await import('../src/main/updater')
+    expect(pickChecksumAsset([{ name: 'release-notes.txt', browser_download_url: 'c', size: 1 }])).toBeUndefined()
+  })
+})

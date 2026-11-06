@@ -266,6 +266,20 @@ jobs:
           gh release create $tag --target $env:GITHUB_SHA --title "Clipwright Studio $version" --notes-file release/notes.md --latest @assets
           Write-Host "released $tag"
 
+          # Download the published asset back and check it against the checksum
+          # we just published. Anything else would be a release that looks fine
+          # in the UI but that the in-app updater cannot verify or install.
+          $tmp = Join-Path $env:RUNNER_TEMP 'verify-download'
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          gh release download $tag --dir $tmp --pattern '*Setup*.exe' --pattern 'checksums.txt'
+          $setup = Get-ChildItem $tmp -Filter '*Setup*.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'the installer is not attached to the release' }
+          $expected = (Select-String -Path (Join-Path $tmp 'checksums.txt') -Pattern ([regex]::Escape($setup.Name))).Line.Split(' ')[0].Trim().ToLower()
+          $actual = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) { throw "published installer digest mismatch (expected $expected, got $actual)" }
+          if ($setup.Length -ne (Get-Item (Join-Path 'release' $setup.Name)).Length) { throw 'published installer size does not match the built one' }
+          Write-Host "verified published installer: $($setup.Name) $($setup.Length) bytes $actual"
+
       - name: Publish a downloadable build
         if: github.event_name == 'push' && contains(github.event.head_commit.message, '[package]') && !contains(github.event.head_commit.message, '[release]')
         shell: pwsh
