@@ -15,7 +15,8 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 jobs:
   verify:
@@ -58,7 +59,29 @@ jobs:
           Get-ChildItem .smoke-res -Recurse -File | Select-Object Name, Length
 
       - name: Export a real video from the build
-        run: node scripts/smoke-render.mjs --resources .smoke-res --out ${{ runner.temp }}/clipwright-smoke.mp4
+        id: smoke
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node scripts/smoke-render.mjs --resources .smoke-res --out $env:RUNNER_TEMP/smoke.mp4 2>&1 |
+            Tee-Object -FilePath smoke.log
+          if ($LASTEXITCODE -ne 0) { Write-Host "smoke render exited $LASTEXITCODE"; exit 1 }
+
+      # The Actions log is only visible inside GitHub's UI. When the smoke test
+      # fails, the tail is posted as a commit comment so it can be read (and
+      # linked) from anywhere, including scripts.
+      - name: Publish the smoke log on failure
+        if: steps.smoke.outcome == 'failure'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tail = if (Test-Path smoke.log) { (Get-Content smoke.log -Tail 80) -join "`n" } else { 'smoke.log was not produced' }
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $body = "Smoke render failed for ``$short``.`n`n``````n$tail`n``````"
+          $body | Set-Content smoke-body.md
+          gh api -X POST "repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA/comments" -F body=@smoke-body.md
+          exit 1
 
   # Runs when a commit asks for it (`[package]` in the message) or by hand.
   # Once this branch is merged, `release.yml` becomes the canonical build
