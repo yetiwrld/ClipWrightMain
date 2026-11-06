@@ -201,6 +201,36 @@ export default function App(): JSX.Element {
           setImportUrlMode(false)
           setImportOpen(true)
           break
+        case 'import-package': {
+          void (async () => {
+            try {
+              const opened = await api.projects.importPackage()
+              if (!opened) return
+              await open(opened.id)
+              notify({ kind: 'success', title: 'Project package imported', body: opened.name })
+            } catch (error) {
+              notify({ kind: 'error', title: 'Import failed', body: errorMessage(error) })
+            }
+          })()
+          break
+        }
+        case 'export-package': {
+          const current = useEditor.getState().project
+          if (!current) {
+            notify({ kind: 'info', title: 'Nothing to package', body: 'Open a project first.' })
+            break
+          }
+          void (async () => {
+            try {
+              const file = await api.projects.exportPackage(current.id, true)
+              notify({ kind: 'success', title: 'Project package exported', body: file })
+              void api.app.revealPath(file)
+            } catch (error) {
+              notify({ kind: 'error', title: 'Export failed', body: errorMessage(error) })
+            }
+          })()
+          break
+        }
         case 'open-settings':
           setScreen('settings')
           break
