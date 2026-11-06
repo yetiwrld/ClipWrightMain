@@ -11,7 +11,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { baseClip } from '@shared/timeline'
+import { baseClip, ensureTrack } from '@shared/timeline'
 import { buildCaptionClips, presetById } from '@shared/captions'
 import { pickKeywordIndices } from '@shared/captions'
 import { canvasSizeFor, recommendAspect } from '@shared/presets'
@@ -37,7 +37,7 @@ export function generateClipProject(opts: GenerateClipOptions): Project {
   const { moment, sourceProject, transcript } = opts
   const aspect = opts.aspect || sourceProject.canvas.aspect
   const { width, height } = canvasSizeFor(aspect, 1920)
-  const project = createProject(opts.name, aspect, opts.fps)
+  let project = createProject(opts.name, aspect, opts.fps)
   project.canvas.width = width
   project.canvas.height = height
   project.canvas.fps = opts.fps
@@ -50,7 +50,15 @@ export function generateClipProject(opts: GenerateClipOptions): Project {
   project.captionPresetId = opts.captionPreset.id
 
   const duration = moment.end - moment.start
-  const videoTrack = project.tracks.find((t) => t.kind === 'video')!
+  /*
+   * Both tracks are created on demand. These were non-null assertions (`!`) over
+   * `Array.find`, so a project without a video or caption track threw a
+   * TypeError part-way through generation — after the new project had already
+   * been written to disk, leaving an empty project behind.
+   */
+  const video = ensureTrack(project, 'video', 'Video 1')
+  project = video.project
+  const videoTrack = video.track
   const sourceAsset =
     sourceProject.assets.find((a) => a.id === project.source?.assetId) ??
     sourceProject.assets.find((a) => a.kind === 'video')
@@ -69,7 +77,9 @@ export function generateClipProject(opts: GenerateClipOptions): Project {
   }
 
   if (opts.includeCaptions !== false && transcript.segments.length) {
-    const captionTrack = project.tracks.find((t) => t.kind === 'caption')!
+    const caption = ensureTrack(project, 'caption', 'Captions')
+    project = caption.project
+    const captionTrack = caption.track
     const captions = buildCaptionClips(
       transcript.segments,
       { start: moment.start, end: moment.end },

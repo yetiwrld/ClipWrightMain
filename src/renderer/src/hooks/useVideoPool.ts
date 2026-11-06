@@ -14,6 +14,14 @@ interface PoolEntry {
   video: HTMLVideoElement
   ready: boolean
   lastSeek: number
+  /**
+   * Where the element should end up. Seeks are expensive and asynchronous: the
+   * old code assigned `currentTime` on every animation frame, so scrubbing (or a
+   * frame-accurate edit while paused) issued a seek per frame and the element
+   * spent its whole time cancelling and restarting them — the "seek thrash" in
+   * the log, and the reason the picture lagged the playhead.
+   */
+  pendingSeek: number | null
 }
 
 export interface VideoPool {
@@ -47,12 +55,22 @@ export function createVideoPool(onReady?: () => void): VideoPool {
     video.style.pointerEvents = 'none'
     video.addEventListener('loadeddata', () => {
       const entry = videos.get(assetId)
-      if (entry) entry.ready = true
+      if (entry) {
+        entry.ready = true
+        if (entry.pendingSeek !== null) applyPendingSeek(entry)
+      }
       onReady?.()
     })
-    video.addEventListener('seeked', () => onReady?.())
+    video.addEventListener('seeked', () => {
+      /*
+       * A seek that finished while a newer target was queued must be followed by
+       * that newer one, otherwise the last scrub of a gesture never lands.
+       */
+      if (entry.pendingSeek !== null) applyPendingSeek(entry)
+      onReady?.()
+    })
     document.body.appendChild(video)
-    const entry: PoolEntry = { video, ready: false, lastSeek: 0 }
+    const entry: PoolEntry = { video, ready: false, lastSeek: 0, pendingSeek: null }
     videos.set(assetId, entry)
     return entry
   }
@@ -81,6 +99,34 @@ export function createVideoPool(onReady?: () => void): VideoPool {
     }
   }
 
+  /**
+   * Coalesced seek: keep at most one seek in flight per element.
+   *
+   * Assigning `currentTime` while the element is already seeking makes Chromium
+   * abort the pending seek and start again, which is why a scrub could take
+   * hundreds of milliseconds to show anything. The latest target is remembered
+   * and applied when the current seek completes.
+   */
+  function requestSeek(entry: PoolEntry, target: number): void {
+    const { video } = entry
+    if (entry.pendingSeek !== null && Math.abs(target - entry.pendingSeek) < 0.001) return
+    entry.pendingSeek = target
+    if (video.seeking) return
+    applyPendingSeek(entry)
+  }
+
+  function applyPendingSeek(entry: PoolEntry): void {
+    const target = entry.pendingSeek
+    if (target === null) return
+    entry.pendingSeek = null
+    entry.lastSeek = target
+    try {
+      entry.video.currentTime = target
+    } catch {
+      /* a detached element throws; the next sync re-creates it */
+    }
+  }
+
   /** Align each video element with the timeline position. */
   function sync(project: Project, timeMs: number, playing: boolean): void {
     projectRef.current = project
@@ -104,12 +150,17 @@ export function createVideoPool(onReady?: () => void): VideoPool {
         entry.video.volume = Math.min(1, Math.max(0, clip.audio.volume))
         if (entry.video.paused) void entry.video.play().catch(() => undefined)
         // Only correct large drift so playback stays smooth.
-        if (drift > 0.22) entry.video.currentTime = target
+        if (drift > 0.22) requestSeek(entry, target)
       } else {
         entry.video.pause()
-        if (drift > 0.6 || (!entry.video.seeking && drift > 0.04)) {
-          entry.video.currentTime = target
-        }
+        /*
+         * While paused, the target is whatever the user is looking at. Issue one
+         * seek and let it land; a newer target replaces the pending one, and a
+         * seek already in flight is never restarted (that is what "seeking"
+         * means here). Sub-frame differences are ignored — they are invisible
+         * and each one costs a full decode.
+         */
+        if (drift > 0.04) requestSeek(entry, target)
       }
     }
     // Pause anything not on screen.

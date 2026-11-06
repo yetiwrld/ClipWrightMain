@@ -9,13 +9,13 @@ import { useApp } from '../state/app'
 import { Badge, Button, EmptyState, Field, Modal, Segmented, Slider, Switch } from '../components/ui'
 import { buildCaptionClips } from '@shared/captions'
 import { BASE_TEXT_STYLE, FONT_STACKS } from '@shared/presets'
-import { makeTrack } from '@shared/timeline'
+import { ensureTrack, makeTrack } from '@shared/timeline'
 import { formatClock } from '@shared/time'
 import { api, errorMessage } from '../lib/api'
 import type { CaptionPreset, Clip, TextStyle } from '@shared/types'
 
 export function CaptionsStudio(): JSX.Element {
-  const { project, playhead } = useEditor()
+  const { project, playhead, activeTrackId } = useEditor()
   const notify = useEditor((s) => s.notify)
   const apply = useEditor((s) => s.apply)
   const selectClips = useEditor((s) => s.selectClips)
@@ -89,13 +89,24 @@ export function CaptionsStudio(): JSX.Element {
         : 0
       apply(
         (p) => {
-          const existing = p.tracks.find((t) => t.kind === 'caption')
-          const track = existing ?? makeTrack('caption', 'Captions', p.tracks.length)
+          /*
+           * Captions go on the *active* caption track when there is one, and a
+           * track is created when there is not. `find` alone meant that with two
+           * caption tracks (say one per speaker) generation always replaced the
+           * first one's clips, whatever track the user had selected.
+           */
+          const preferred = p.tracks.find((t) => t.id === activeTrackId && t.kind === 'caption')
+          const ensured = preferred ? { project: p, track: preferred } : ensureTrack(p, 'caption', 'Captions')
+          const track = ensured.track
           const clips = buildCaptionClips(transcript.segments, { start: 0, end }, preset, track.id, 0)
           return {
-            ...p,
-            tracks: existing ? p.tracks : [...p.tracks, track],
-            clips: [...p.clips.filter((c) => c.kind !== 'caption'), ...clips]
+            ...ensured.project,
+            // Only this track's captions are replaced; other caption tracks keep
+            // whatever the user put on them.
+            clips: [
+              ...ensured.project.clips.filter((c) => !(c.kind === 'caption' && c.trackId === track.id)),
+              ...clips
+            ]
           }
         },
         'Generate captions'

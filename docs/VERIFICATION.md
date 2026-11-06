@@ -18,7 +18,7 @@ pre-release `build-c585d1f` (rebuilt as `build-61bdda7` with cleaner file names)
 | step | result |
 |---|---|
 | typecheck (main + renderer) | pass |
-| vitest, including the 9 ffmpeg render tests | 115/115 pass (93 here + render/export tests on CI) |
+| vitest, including the 9 ffmpeg render tests | see §1 (169 at 1.0.6) |
 | electron-builder (NSIS per-user + portable) | pass — 139.9 MB setup, 139.6 MB portable |
 | asar contents (`out/main`, `out/preload`, `out/renderer`, `node_modules/fflate`) | pass |
 | bundled `ffmpeg.exe` / `ffprobe.exe` run and report a version | pass |
@@ -31,18 +31,40 @@ So the installer is no longer "configured but unverified": it was built, the
 packaged application was started, and it encoded a video with the ffmpeg that
 ships inside it.
 
-## 1. Automated tests — 115 passed (106 here, 9 render tests on CI)
+## 1. Automated tests — 170 passed (14 files)
 
 `npm test` (vitest, single fork, node environment).
 
 | suite | tests | covers |
 |---|---|---|
+| `tests/round5-regressions.test.ts` | 31 | 1.0.6 fixes: duration units, orphan clips, mute/solo/lock, range semantics, caption tracks, whisper validation, preview/export parity |
+| `tests/export-regressions.test.ts` | 22 | export correctness: encoders, filters, escaping, alpha, transitions |
 | `tests/editor.test.ts` | 22 | timeline engine and shared editing logic |
-| `tests/ui.test.tsx` | 16 | renderer boot, onboarding, editor components (jsdom) |
+| `tests/ui.test.tsx` | 22 | renderer boot, onboarding, editor components, undo gestures (jsdom) |
+| `tests/audit-fixes.test.ts` | 18 | validation maths, srt ms, keyword order, crop clamp, private addresses, zip bounds |
+| `tests/regressions.test.ts` | 17 | earlier rounds' fixes held in place |
+| `tests/playback-and-models.test.ts` | 9 | Space playback, replay-from-end, model lookup |
+| `tests/render.test.ts` | 9 | real ffmpeg encodes; run in CI, and locally against ffmpeg 9.0.2 |
+| `tests/runtimes.test.ts` | 5 | runtime discovery (whisper/llama/ollama) |
 | `tests/packages.test.ts` | 4 | `.clipwright` export/import round-trip |
 | `tests/open-package.test.ts` | 3 | file-association argument parsing |
 | `tests/logs.test.ts` | 3 | log tail reading (line window, empty file, live writes) |
-| `tests/render.test.ts` | 9 | real ffmpeg encodes; run in CI, and locally against ffmpeg 9.0.2 |
+| `tests/startup.test.ts` | 3 | startup sequencing |
+| `tests/clip-pipeline.test.ts` | 2 | real clip generation + export |
+| **total** | **170** | |
+
+### What the 1.0.6 fixes are verified by
+
+| fix | verified by |
+|---|---|
+| clip durations are validated in one place | `round5-regressions` (unit conversion, negative/NaN rejection) + `ui.test.tsx` (an Inspector-style edit of `-5` lands on the minimum and is undoable) |
+| removing a track cannot leave a ghost selection | `ui.test.tsx` "prunes the selection when a track is removed" — drives the real store action and asserts the selection *and* the active track are repaired |
+| one undo entry per drag gesture | `ui.test.tsx` — 25 live frames produce exactly one history entry, undo returns to the pre-drag state, a click with no movement produces none, and a stale commit from a finished gesture is ignored |
+| mute / solo / visibility are one predicate | `round5-regressions` — asserts the two former implementations agree for every track kind, and that soloing a video track removes captions from the scene |
+| range/overwrite semantics | `round5-regressions` — empty and inverted ranges are no-ops, overwrite trims instead of deleting, slivers are dropped, and keyframes are re-anchored |
+| caption tracks are created, not asserted | `round5-regressions` — a project with no caption track gets one; an existing one is reused |
+| whisper model/binary validation | `round5-regressions` — missing, empty, truncated, non-ggml and stub-binary cases each produce a specific message |
+| preview and export draw the same transition | `round5-regressions` renders the generated filter with the real ffmpeg and compares the alpha byte at 0.25/0.5/0.75 s against `transitionAlpha`: within 4/255 for both curved presets |
 
 Specific invariants asserted (not smoke tests):
 

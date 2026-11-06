@@ -5,7 +5,7 @@
  * engine — so what you see is what is rendered. Text is laid out with exact
  * metrics and the animation state comes from the shared engine.
  */
-import { buildScene, type Scene, type SceneLayer } from '@shared/scene'
+import { buildScene, projectIndex, type Scene, type SceneLayer } from '@shared/scene'
 import { parseColour, toCssColour, withAlpha } from '@shared/colour'
 import {
   baselineInLine,
@@ -81,7 +81,8 @@ function drawMediaLayer(
   canvasH: number
 ): void {
   if (!layer.assetId) return
-  const asset = project.assets.find((a) => a.id === layer.assetId)
+  // Indexed lookup: this runs once per video/image layer on every preview frame.
+  const asset = projectIndex(project).assets.get(layer.assetId)
   let source: HTMLVideoElement | HTMLImageElement | null = null
   if (asset?.kind === 'image') {
     source = media.image(layer.assetId)

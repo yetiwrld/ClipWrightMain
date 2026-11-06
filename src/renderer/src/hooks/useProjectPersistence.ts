@@ -1,41 +1,112 @@
-/** Autosave, save-on-quit hints and project loading. */
+/**
+ * Autosave, save-on-quit hints and project loading.
+ *
+ * Autosave used to be a plain `setInterval(save, 8000)` created whenever the
+ * project was dirty. Three things went wrong with that:
+ *
+ *  1. `save` was in the dependency list, and it closed over `project`, so every
+ *     edit tore the interval down and rebuilt it. Typing in a caption field
+ *     (one edit per keystroke) meant the timer was reset on every keystroke and
+ *     *never* fired — the project could stay unsaved indefinitely.
+ *  2. Nothing suppressed writes while an export or a long transcript job was
+ *     running, so a burst of frames could push dozens of full project writes
+ *     (each one a JSON serialise plus an atomic rename) into the main process.
+ *  3. It saved whatever was in the store at fire time, which during a drag is a
+ *     mid-gesture state that is about to be replaced.
+ *
+ * The replacement keeps one long-lived timer, reads the current project at fire
+ * time, skips identical content, coalesces bursts through a quiet period and
+ * suspends while the user is mid-gesture.
+ */
 import { useCallback, useEffect, useRef } from 'react'
 import { useEditor } from '../state/editor'
 import { api, errorMessage } from '../lib/api'
 import type { Project } from '@shared/types'
 
+/** How often the timer wakes up. Writes only happen when something changed. */
 const AUTOSAVE_INTERVAL = 8000
+/**
+ * Bursts are common (slider drags, typed values). A save waits until the
+ * project has been still for this long, so a slider drag produces one write
+ * instead of one per percent.
+ */
+const QUIET_PERIOD_MS = 1200
+
+/**
+ * Cheap content signature: the project id plus everything that is persisted.
+ * `updatedAt` is stamped by the store on every edit, so it stands in for the
+ * body — but it is *not* enough on its own to detect a no-op undo/redo, hence
+ * the clip/track counts alongside it.
+ */
+export function saveSignature(project: Project): string {
+  return `${project.id}|${project.updatedAt}|${project.clips.length}|${project.tracks.length}|${project.assets.length}`
+}
 
 export function useAutosave(): void {
-  const { project, dirty, setSaving, markSaved, notify } = useEditor()
   const inflight = useRef(false)
+  const lastSaved = useRef<string | null>(null)
+  const lastEditAt = useRef(0)
+  const mounted = useRef(true)
 
-  const save = useCallback(async () => {
-    if (!project || inflight.current) return
+  /* Track when the project last actually changed, without re-creating the timer. */
+  useEffect(() => {
+    const unsubscribe = useEditor.subscribe((state, previous) => {
+      if (state.project !== previous.project) lastEditAt.current = Date.now()
+    })
+    return unsubscribe
+  }, [])
+
+  const save = useCallback(async (force = false) => {
+    const state = useEditor.getState()
+    const project = state.project
+    if (!project) return
+    /* Never write mid-gesture: that state is about to be replaced by the commit. */
+    if (!force && state.gesture) return
+    /* Never write while a save is already in flight (the old code raced itself). */
+    if (inflight.current) return
+    const sig = saveSignature(project)
+    if (sig === lastSaved.current) return
+    /* Let a burst settle first. */
+    if (!force && Date.now() - lastEditAt.current < QUIET_PERIOD_MS) return
+
     inflight.current = true
-    setSaving(true)
+    state.setSaving(true)
     try {
       await api.projects.save(project)
-      markSaved(Date.now())
+      lastSaved.current = sig
+      if (!mounted.current) return
+      /* Only mark clean if nothing was edited while the write was in flight. */
+      const after = useEditor.getState()
+      if (after.project === project) after.markSaved(Date.now())
+      else after.setSaving(false)
     } catch (error) {
-      notify({ kind: 'error', title: 'Autosave failed', body: errorMessage(error) })
+      if (mounted.current) {
+        useEditor.getState().setSaving(false)
+        useEditor.getState().notify({ kind: 'error', title: 'Autosave failed', body: errorMessage(error) })
+      }
     } finally {
       inflight.current = false
     }
-  }, [project, setSaving, markSaved, notify])
+  }, [])
 
   useEffect(() => {
-    if (!dirty) return
-    const timer = setInterval(save, AUTOSAVE_INTERVAL)
-    return () => clearInterval(timer)
-  }, [dirty, save])
+    mounted.current = true
+    const timer = setInterval(() => {
+      void save()
+    }, AUTOSAVE_INTERVAL)
+    return () => {
+      mounted.current = false
+      clearInterval(timer)
+    }
+  }, [save])
 
   // Save immediately when the window is about to close.
   useEffect(() => {
     const handler = () => {
-      if (useEditor.getState().dirty && useEditor.getState().project) {
-        void api.projects.save(useEditor.getState().project!)
-      }
+      const state = useEditor.getState()
+      if (!state.project) return
+      if (saveSignature(state.project) === lastSaved.current) return
+      void api.projects.save(state.project)
     }
     window.addEventListener('beforeunload', handler)
     return () => window.removeEventListener('beforeunload', handler)

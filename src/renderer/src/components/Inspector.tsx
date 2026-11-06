@@ -28,6 +28,7 @@ import {
 import { EASING_OPTIONS } from '@shared/easing'
 import { addKeyframe, removeKeyframe, sampleTrack, updateKeyframe } from '@shared/keyframes'
 import { formatClock } from '@shared/time'
+import { MIN_AUTHORED_DURATION, legalPatch } from '@shared/timeline'
 import type { AnimatableProp, CaptionAnimation, Clip, EasingKind, TransitionType } from '@shared/types'
 
 const ANIMATABLE: { prop: AnimatableProp; label: string }[] = [
@@ -98,8 +99,21 @@ export function Inspector(): JSX.Element {
 function useClipUpdater(clip: Clip) {
   const apply = useEditor((s) => s.apply)
   return {
+    /*
+     * Every Inspector edit is a discrete user action, so it belongs in the undo
+     * history. The store's `updateClip` defaults to history:false (it is also
+     * driven by drag frames), which is why retiming a clip, changing a style or
+     * lowering a volume could never be undone. The patch is normalised on the
+     * way in for the same reason: a typed duration is untrusted input.
+     */
     patch: (patch: Partial<Clip>, label = 'Edit clip') =>
-      apply((p) => ({ ...p, clips: p.clips.map((c) => (c.id === clip.id ? { ...c, ...patch } : c)) }), label),
+      apply(
+        (p) => ({
+          ...p,
+          clips: p.clips.map((c) => (c.id === clip.id ? { ...c, ...legalPatch(patch) } : c))
+        }),
+        label
+      ),
     live: (patch: Partial<Clip>) =>
       useEditor.getState().applyLive((p) => ({
         ...p,
@@ -308,7 +322,7 @@ function PropertiesTab({ clip }: { clip: Clip }): JSX.Element {
                 key={`dur-${clip.duration}`}
                 onBlur={(e) => {
                   const ms = parseClock(e.target.value)
-                  if (ms !== null && ms > 80) updater.patch({ duration: ms }, 'Retime clip')
+                  if (ms !== null) updater.patch({ duration: ms }, 'Retime clip')
                 }}
               />
             </Field>
@@ -329,7 +343,7 @@ function PropertiesTab({ clip }: { clip: Clip }): JSX.Element {
           <div className="row">
             <Button
               size="sm"
-              disabled={local < 120}
+              disabled={local < MIN_AUTHORED_DURATION}
               title="Trim the clip so it ends at the playhead"
               onClick={() => updater.patch({ duration: local }, 'Trim to playhead')}
             >
@@ -337,7 +351,7 @@ function PropertiesTab({ clip }: { clip: Clip }): JSX.Element {
             </Button>
             <Button
               size="sm"
-              disabled={local < 120 || local >= clip.duration - 100}
+              disabled={local < MIN_AUTHORED_DURATION || local >= clip.duration - MIN_AUTHORED_DURATION}
               title="Discard everything before the playhead"
               onClick={() =>
                 updater.patch(

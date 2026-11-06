@@ -81,8 +81,8 @@ npm run dist:win
 Artifacts land in `release/`:
 
 ```
-Clipwright Studio-Setup-1.0.0-x64.exe      per-user NSIS installer
-Clipwright Studio-Portable-1.0.0-x64.exe   no-install single file
+Clipwright Studio-Setup-1.0.6-x64.exe      per-user NSIS installer
+Clipwright Studio-Portable-1.0.6-x64.exe   no-install single file
 ```
 
 The installer is per-user (no UAC prompt), registers `.clipwright` files for the

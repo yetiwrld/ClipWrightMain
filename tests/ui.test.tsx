@@ -12,7 +12,7 @@ import React from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { act } from 'react-dom/test-utils'
 import { createProject, DEFAULT_SETTINGS } from '@shared/defaults'
-import { baseClip, defaultTracks } from '@shared/timeline'
+import { MIN_CLIP_DURATION, baseClip, defaultTracks, legalDuration, removeTrack } from '@shared/timeline'
 import { addKeyframe, sampleTrack } from '@shared/keyframes'
 import { buildCaptionClips } from '@shared/captions'
 import { FALLBACK_CAPTION_PRESETS } from '@shared/presets'
@@ -370,6 +370,137 @@ describe('editor store', () => {
     expect(useEditor.getState().project!.clips.length).toBe(0)
     useEditor.getState().redo()
     expect(useEditor.getState().project!.clips.length).toBe(1)
+  })
+
+  it('records exactly one undo entry for a drag gesture', async () => {
+    const { useEditor } = await import('@/state/editor')
+    const project = createProject('gesture', '9:16', 30)
+    const track = project.tracks.find((t) => t.kind === 'video')!
+    const clip = baseClip('video', track.id, 'drag.mp4')
+    clip.start = 0
+    clip.duration = 2000
+    project.clips.push(clip)
+    useEditor.getState().setProject(project)
+    const historyBefore = useEditor.getState().past.length
+
+    // A drag: one gesture, many frames.
+    useEditor.getState().beginGesture('g-drag-1', 'Move clips')
+    for (let x = 1; x <= 25; x++) {
+      useEditor.getState().applyLive((p) => ({
+        ...p,
+        clips: p.clips.map((c) => (c.id === clip.id ? { ...c, start: x * 40 } : c))
+      }))
+    }
+    useEditor.getState().commitHistory('Move clips', 'g-drag-1')
+
+    expect(useEditor.getState().past.length).toBe(historyBefore + 1)
+    expect(useEditor.getState().project!.clips[0].start).toBe(1000)
+
+    // Undo returns to before the drag — not to a mid-drag frame.
+    useEditor.getState().undo()
+    expect(useEditor.getState().project!.clips[0].start).toBe(0)
+  })
+
+  it('does not record a gesture that never moved anything', async () => {
+    const { useEditor } = await import('@/state/editor')
+    const project = createProject('noclick', '9:16', 30)
+    const track = project.tracks.find((t) => t.kind === 'video')!
+    const clip = baseClip('video', track.id, 'still.mp4')
+    clip.start = 0
+    clip.duration = 2000
+    project.clips.push(clip)
+    useEditor.getState().setProject(project)
+    const historyBefore = useEditor.getState().past.length
+
+    // Pointer down and up with no movement (a plain click on the clip).
+    useEditor.getState().beginGesture('g-click-1', 'Move clips')
+    useEditor.getState().commitHistory('Move clips', 'g-click-1')
+    expect(useEditor.getState().past.length).toBe(historyBefore)
+  })
+
+  it('ignores a stale commit from a gesture that already finished', async () => {
+    const { useEditor } = await import('@/state/editor')
+    const project = createProject('stale', '9:16', 30)
+    const track = project.tracks.find((t) => t.kind === 'video')!
+    const clip = baseClip('video', track.id, 'a.mp4')
+    clip.start = 0
+    clip.duration = 1000
+    project.clips.push(clip)
+    useEditor.getState().setProject(project)
+    const before = useEditor.getState().past.length
+    useEditor.getState().beginGesture('g-one', 'Move clips')
+    useEditor.getState().applyLive((p) => ({ ...p, clips: p.clips.map((c) => ({ ...c, start: 200 })) }))
+    // A second drag starts before the first one's pointerup arrives.
+    useEditor.getState().commitHistory('Move clips', 'g-two')
+    expect(useEditor.getState().past.length).toBe(before)
+    useEditor.getState().commitHistory('Move clips', 'g-one')
+    expect(useEditor.getState().past.length).toBe(before + 1)
+  })
+
+  it('undoes a transform through the gesture snapshot, not a no-op', async () => {
+    const { useEditor } = await import('@/state/editor')
+    const project = createProject('transform', '9:16', 30)
+    const track = project.tracks.find((t) => t.kind === 'video')!
+    const clip = baseClip('video', track.id, 'a.mp4')
+    clip.start = 0
+    clip.duration = 1000
+    project.clips.push(clip)
+    useEditor.getState().setProject(project)
+    const before = useEditor.getState().past.length
+
+    useEditor.getState().setClipTransform(clip.id, { x: 0.1 })
+    useEditor.getState().setClipTransform(clip.id, { x: 0.9 })
+    useEditor.getState().finishTransformDrag(clip.id)
+    expect(useEditor.getState().past.length).toBe(before + 1)
+
+    useEditor.getState().undo()
+    expect(useEditor.getState().project!.clips[0].transform.x).toBe(0.5)
+  })
+
+  it('makes Inspector edits undoable and validated', async () => {
+    const { useEditor } = await import('@/state/editor')
+    const project = createProject('inspector', '9:16', 30)
+    const track = project.tracks.find((t) => t.kind === 'video')!
+    const clip = baseClip('video', track.id, 'a.mp4')
+    clip.start = 0
+    clip.duration = 2000
+    project.clips.push(clip)
+    useEditor.getState().setProject(project)
+    const before = useEditor.getState().past.length
+    // The store path used by the Inspector: a discrete, undoable edit.
+    useEditor.getState().apply(
+      (p) => ({ ...p, clips: p.clips.map((c) => ({ ...c, duration: legalDuration(-5) })) }),
+      'Retime clip'
+    )
+    expect(useEditor.getState().past.length).toBe(before + 1)
+    expect(useEditor.getState().project!.clips[0].duration).toBe(MIN_CLIP_DURATION)
+    useEditor.getState().undo()
+    expect(useEditor.getState().project!.clips[0].duration).toBe(2000)
+  })
+
+  it('prunes the selection when a track is removed', async () => {
+    const { useEditor } = await import('@/state/editor')
+    const project = createProject('prune', '9:16', 30)
+    const track = project.tracks.find((t) => t.kind === 'video')!
+    const clip = baseClip('video', track.id, 'a.mp4')
+    clip.start = 0
+    clip.duration = 2000
+    project.clips.push(clip)
+    useEditor.getState().setProject(project)
+    useEditor.getState().selectClips([clip.id])
+    useEditor.getState().setActiveTrack(track.id)
+    expect(useEditor.getState().selectedClipIds).toEqual([clip.id])
+
+    // Removing the track deletes the clip, then the selection is pruned.
+    useEditor.getState().apply((p) => removeTrack(p, track.id), 'Remove track')
+    useEditor.getState().pruneSelection()
+
+    expect(useEditor.getState().project!.clips).toHaveLength(0)
+    // The dead id is gone: no ghost in the Inspector, no phantom delete.
+    expect(useEditor.getState().selectedClipIds).toEqual([])
+    expect(useEditor.getState().activeTrackId).not.toBe(track.id)
+    // …and it still points at a real track, so the next operation has a target.
+    expect(useEditor.getState().project!.tracks.some((t) => t.id === useEditor.getState().activeTrackId)).toBe(true)
   })
 
   it('clamps the playhead to the timeline and snaps to frames', async () => {

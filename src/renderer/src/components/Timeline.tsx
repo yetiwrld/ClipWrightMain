@@ -47,6 +47,8 @@ const RULER_H = 30
 const HEADER_W = 168
 
 interface DragState {
+  /** Unique per gesture; the undo entry is keyed on it (see editor.beginGesture). */
+  gestureId: string
   kind: 'move' | 'trim-start' | 'trim-end' | 'marquee' | 'playhead'
   clipIds: string[]
   startClientX: number
@@ -104,6 +106,7 @@ export function Timeline(): JSX.Element {
   const setActiveTrack = useEditor((s) => s.setActiveTrack)
   const applyLive = useEditor((s) => s.applyLive)
   const commitHistory = useEditor((s) => s.commitHistory)
+  const beginGesture = useEditor((s) => s.beginGesture)
   const toggleSnapping = useEditor((s) => s.toggleSnapping)
   const actions = useTimelineActions()
   const { updateTrack, trim, placeClip, removeMarker, addMarker } = actions
@@ -118,6 +121,9 @@ export function Timeline(): JSX.Element {
   /* Panel height lives in state (not CSS `resize`) so it can be dragged from a
      real handle, and so it is clamped against the window height every frame. */
   const panelHeightRef = useRef(320)
+  /* Scrub coalescing: the latest pointer position, and the frame that will apply it. */
+  const scrubPending = useRef<number | null>(null)
+  const scrubFrame = useRef(0)
   const [panelHeight, setPanelHeight] = useState(() => {
     const stored = Number(typeof localStorage !== 'undefined' ? localStorage.getItem('clipwright.timelineHeight') : 0)
     return Number.isFinite(stored) && stored >= 120 ? stored : 320
@@ -150,6 +156,13 @@ export function Timeline(): JSX.Element {
   }
   panelHeightRef.current = panelHeight
 
+  useEffect(
+    () => () => {
+      if (scrubFrame.current) cancelAnimationFrame(scrubFrame.current)
+    },
+    []
+  )
+
   /* A short window must not leave the preview with no room at all. */
   useEffect(() => {
     const onResize = () =>
@@ -166,30 +179,55 @@ export function Timeline(): JSX.Element {
   const timelineWidth = Math.max(760, Math.ceil(((duration + 15000) / 1000) * zoom))
   const pxPerMs = zoom / 1000
 
-  /* Waveform peaks come from the main process cache; missing ones are ignored. */
+  /*
+   * Waveform peaks come from the main process cache (ffmpeg writes them, never
+   * the UI thread). Loading them had three problems:
+   *
+   *  • `waveforms` was in the dependency list while the effect wrote to it, so
+   *    every successful load re-ran the whole loop — and each re-run issued the
+   *    requests for the *other* assets again. A project with twenty audio clips
+   *    made roughly n²/2 requests, which is what showed up as the timeline
+   *    stalling and the main process answering the same JSON over and over.
+   *  • The loop awaited each fetch in turn, so the waveforms appeared one at a
+   *    time in asset order.
+   *  • A failed asset was retried on every project edit, forever.
+   *
+   * Requests are now issued once per asset, in parallel, through a ref that
+   * remembers what has been asked for.
+   */
+  const requestedWaveforms = useRef<Set<string>>(new Set())
+  /* A different project starts from scratch: peak files belong to its assets. */
+  const waveformProjectId = useRef<string | null>(null)
   useEffect(() => {
     if (!project) return
+    if (waveformProjectId.current !== project.id) {
+      waveformProjectId.current = project.id
+      requestedWaveforms.current = new Set()
+      setWaveforms({})
+      return
+    }
     let cancelled = false
-    const load = async () => {
-      for (const asset of project.assets) {
-        if (!asset.waveform || waveforms[asset.id]) continue
+    const wanted = project.assets.filter((asset) => asset.waveform && !requestedWaveforms.current.has(asset.id))
+    for (const asset of wanted) {
+      requestedWaveforms.current.add(asset.id)
+      void (async () => {
         try {
-          const response = await fetch(api.mediaUrl(asset.waveform))
-          if (!response.ok) continue
+          const response = await fetch(api.mediaUrl(asset.waveform!))
+          if (!response.ok) return
           const json = (await response.json()) as { peaks: number[]; samplesPerSecond: number }
-          if (!cancelled) setWaveforms((prev) => ({ ...prev, [asset.id]: json }))
+          if (!cancelled) setWaveforms((prev) => (prev[asset.id] ? prev : { ...prev, [asset.id]: json }))
         } catch {
           /* waveforms are decorative — never block the editor on them */
         }
-      }
+      })()
     }
-    void load()
     return () => {
       cancelled = true
     }
-  }, [project, waveforms])
+  }, [project])
 
   const trackList = useMemo(() => (project ? compositingOrder(project) : []), [project])
+  const anySolo = useMemo(() => Boolean(project?.tracks.some((t) => t.solo)), [project])
 
   /* ------------------------------ pointer math ------------------------------ */
 
@@ -235,6 +273,7 @@ export function Timeline(): JSX.Element {
   const beginDrag = (event: React.PointerEvent, drag: DragState) => {
     const target = event.currentTarget as HTMLElement
     dragRef.current = drag
+    beginGesture(drag.gestureId, drag.kind === 'move' ? 'Move clips' : 'Trim clip')
     try {
       target.setPointerCapture(event.pointerId)
     } catch {
@@ -265,6 +304,7 @@ export function Timeline(): JSX.Element {
         : [clip.id]
     const selected = project!.clips.filter((c) => ids.includes(c.id))
     beginDrag(event, {
+      gestureId: `drag-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       kind: 'move',
       clipIds: selected.map((c) => c.id),
       startClientX: event.clientX,
@@ -281,6 +321,7 @@ export function Timeline(): JSX.Element {
     event.stopPropagation()
     selectClips([clip.id])
     beginDrag(event, {
+      gestureId: `trim-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       kind: edge === 'start' ? 'trim-start' : 'trim-end',
       clipIds: [clip.id],
       startClientX: event.clientX,
@@ -345,7 +386,11 @@ export function Timeline(): JSX.Element {
         const id = drag.clipIds[0]
         const time = timeAt(event.clientX)
         drag.changed = true
-        trim(id, drag.kind === 'trim-start' ? 'start' : 'end', time, event.altKey)
+        /*
+         * `live` = this is a drag frame, so it belongs to the open gesture. The
+         * old call recorded a full history entry here, once per pointermove.
+         */
+        trim(id, drag.kind === 'trim-start' ? 'start' : 'end', time, event.altKey, true)
         return
       }
 
@@ -363,7 +408,22 @@ export function Timeline(): JSX.Element {
       }
 
       if (drag.kind === 'playhead') {
-        setPlayhead(timeAt(event.clientX), { snap: false, scrub: true })
+        /*
+         * Pointer events arrive faster than frames (a high-rate mouse sends two
+         * or three per frame). Each one used to write the store, so the video
+         * pool was asked to seek on a position that was already stale, and the
+         * preview spent the whole gesture chasing. Coalescing to one update per
+         * animation frame keeps the playhead under the cursor and halves the
+         * work.
+         */
+        scrubPending.current = timeAt(event.clientX)
+        if (scrubFrame.current === 0) {
+          scrubFrame.current = requestAnimationFrame(() => {
+            scrubFrame.current = 0
+            const next = scrubPending.current
+            if (next !== null) setPlayhead(next, { snap: false, scrub: true })
+          })
+        }
       }
     },
     [project, pxPerMs, snapping, applyLive, setPlayhead, trim]
@@ -394,7 +454,7 @@ export function Timeline(): JSX.Element {
     }
     setMarquee(null)
     if (drag?.changed) {
-      commitHistory(drag.kind === 'move' ? 'Move clips' : 'Trim clip')
+      commitHistory(drag.kind === 'move' ? 'Move clips' : 'Trim clip', drag.gestureId)
     }
   }, [marquee, project, trackList, zoom, scrollLeft, selectClips, commitHistory])
 
@@ -606,6 +666,7 @@ export function Timeline(): JSX.Element {
                 onPointerDown={(e) => {
                   if (e.button !== 0) return
                   beginDrag(e, {
+                    gestureId: `head-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
                     kind: 'playhead',
                     clipIds: [],
                     startClientX: e.clientX,
@@ -626,14 +687,30 @@ export function Timeline(): JSX.Element {
             {trackList.map((track) => {
               const clips = project.clips.filter((c) => c.trackId === track.id)
               const audible = trackIsAudible(project, track)
+              /*
+               * A track that is hidden, or excluded by another track's solo, is
+               * not in the exported frame and not in the preview. The lane now
+               * says so: it used to look completely normal, so a user who had
+               * soloed a video track and then wondered where the captions went
+               * had nothing on screen explaining it.
+               */
+              const dimmed = !track.visible || (anySolo && !track.solo)
               return (
                 <div
                   key={track.id}
                   className={clsx(
                     'timeline__track',
                     track.locked && 'timeline__track--locked',
+                    dimmed && 'timeline__track--dimmed',
                     dropTrack === track.id && 'timeline__track--drop'
                   )}
+                  title={
+                    dimmed
+                      ? anySolo
+                        ? 'Another track is soloed, so this one is not rendered'
+                        : 'This track is hidden and will not be rendered'
+                      : undefined
+                  }
                   style={{ height: track.height }}
                   onPointerDown={() => setActiveTrack(track.id)}
                 >
@@ -649,7 +726,12 @@ export function Timeline(): JSX.Element {
                       <input
                         className="timeline__track-name"
                         value={track.name}
-                        onChange={(e) => updateTrack(track.id, { name: e.target.value })}
+                        onChange={(e) => {
+                          // One undo entry for the whole rename, not per keystroke.
+                          beginGesture(`rename-${track.id}`, 'Rename track')
+                          updateTrack(track.id, { name: e.target.value }, { history: false })
+                        }}
+                        onBlur={() => commitHistory('Rename track', `rename-${track.id}`)}
                         spellCheck={false}
                         aria-label={`Track name: ${track.name}`}
                       />
@@ -694,11 +776,18 @@ export function Timeline(): JSX.Element {
                         e.stopPropagation()
                         const startY = e.clientY
                         const startH = track.height
+                        const gesture = `height-${track.id}`
+                        beginGesture(gesture, 'Resize track')
                         const move = (ev: PointerEvent) =>
-                          updateTrack(track.id, { height: clamp(startH + (ev.clientY - startY), 34, 220) })
+                          updateTrack(
+                            track.id,
+                            { height: clamp(startH + (ev.clientY - startY), 34, 220) },
+                            { history: false }
+                          )
                         const up = () => {
                           window.removeEventListener('pointermove', move)
                           window.removeEventListener('pointerup', up)
+                          commitHistory('Resize track', gesture)
                         }
                         window.addEventListener('pointermove', move)
                         window.addEventListener('pointerup', up)
@@ -717,6 +806,7 @@ export function Timeline(): JSX.Element {
                       setActiveTrack(track.id)
                       const rect = scrollRef.current!.getBoundingClientRect()
                       beginDrag(e, {
+                        gestureId: `marquee-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
                         kind: 'marquee',
                         clipIds: [],
                         startClientX: e.clientX,

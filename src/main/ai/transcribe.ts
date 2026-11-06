@@ -87,6 +87,75 @@ export async function transcribe(opts: TranscribeOptions): Promise<Transcript> {
 /* Local (whisper.cpp)                                                */
 /* ------------------------------------------------------------------ */
 
+/** Is the whisper binary actually runnable? Returns a reason when it is not. */
+export function describeRuntimeProblem(file: string): string | null {
+  try {
+    const stat = fs.statSync(file)
+    if (!stat.isFile()) return 'the path is not a file'
+    if (stat.size < 1024) return 'the file is only a stub, not a real executable'
+    if (process.platform !== 'win32') {
+      fs.accessSync(file, fs.constants.X_OK)
+    }
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'EACCES') {
+      return 'it is not executable (missing the execute permission)'
+    }
+    return error instanceof Error ? error.message : String(error)
+  }
+  return null
+}
+
+/** Smallest plausible ggml whisper model; anything smaller is a truncated file. */
+const MIN_MODEL_BYTES = 1_000_000
+
+/**
+ * Validate a whisper.cpp model file before handing it to the runtime.
+ *
+ * Returns a human-readable problem, or null when the file looks usable.
+ * whisper.cpp models are ggml containers: they start with a magic number and
+ * carry an explicit tensor table, but the checks that actually catch real
+ * breakage are "does it exist, is it big enough, and does it look like ggml at
+ * all". Everything else surfaces as a crash inside the child process.
+ */
+export function describeModelProblem(file: string): string | null {
+  let stat: fs.Stats
+  try {
+    stat = fs.statSync(file)
+  } catch {
+    return 'the file does not exist any more'
+  }
+  if (!stat.isFile()) return 'that path is not a file'
+  if (stat.size === 0) return 'the file is empty (the download probably failed)'
+  if (stat.size < MIN_MODEL_BYTES) {
+    return `the file is only ${stat.size} bytes, which is far too small for a whisper model — it was probably truncated`
+  }
+  try {
+    const fd = fs.openSync(file, 'r')
+    try {
+      const head = Buffer.alloc(4)
+      fs.readSync(fd, head, 0, 4, 0)
+      // ggml stores 0x67676d6c ("ggml") little-endian at offset 0.
+      const magic = head.readUInt32LE(0)
+      const isGgml = magic === 0x67676d6c || magic === 0x67676d66 /* "ggmf" */ || magic === 0x67676a74 /* "ggjt" */
+      if (!isGgml) {
+        // A faster-whisper / HuggingFace `model.bin` is a zip or a torch pickle;
+        // whisper.cpp cannot open it. That mix-up is the one support question
+        // worth answering precisely.
+        return 'the file is not a ggml model (this looks like a faster-whisper model.bin from a HuggingFace cache, which whisper.cpp cannot read — download the ggml-*.bin instead)'
+      }
+      const name = path.basename(file).toLowerCase()
+      if (!name.startsWith('ggml-') && !name.endsWith('.bin')) {
+        return 'the file is a ggml model but is not named like one (ggml-*.bin)'
+      }
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch (error) {
+    return `the file could not be read (${error instanceof Error ? error.message : String(error)})`
+  }
+  return null
+}
+
 async function transcribeLocal(opts: TranscribeOptions, wav: string): Promise<Transcript> {
   const runtime = whisperRuntimePath()
   const wantedModel = opts.model ?? settingsStore().get().transcription.defaultModel
@@ -107,6 +176,16 @@ async function transcribeLocal(opts: TranscribeOptions, wav: string): Promise<Tr
       'Local transcription needs a whisper.cpp binary. Put whisper-cli.exe (with its DLLs) next to the app, in Documents\\Clipwright Studio\\Tools, or anywhere on your PATH, then press “Re-scan this PC” in Settings → Local AI models.'
     )
   }
+  /*
+   * A binary that is found but cannot run (wrong architecture, a stub file, a
+   * DLL missing next to it) used to fail as "whisper.cpp failed (exit -1)" with
+   * the spawn error text as its whole explanation. Check that it is executable
+   * first and name the file in the message.
+   */
+  const runtimeProblem = describeRuntimeProblem(runtime)
+  if (runtimeProblem) {
+    throw new Error(`The whisper.cpp binary at ${runtime} cannot be run: ${runtimeProblem}. Replace it with a working whisper-cli build (matching this PC's architecture), then press “Re-scan this PC”.`)
+  }
   if (!modelFile) {
     // Say what is missing for *whisper.cpp*, because the model people already
     // have is often a faster-whisper `model.bin` from a HuggingFace cache, which
@@ -116,6 +195,17 @@ async function transcribeLocal(opts: TranscribeOptions, wav: string): Promise<Tr
         'Open AI ▸ Transcript and press "Download base.en model" (one click, 142 MB), or copy an existing ggml-*.bin into ' +
         'Documents\\Clipwright Studio\\Models. Note that a faster-whisper "model.bin" from a HuggingFace cache cannot be used by whisper.cpp.'
     )
+  }
+
+  /*
+   * An empty or truncated model file is a much more common failure than a
+   * missing one: an interrupted download, or a 0-byte `ggml-*.bin` left behind
+   * by a cancelled fetch. whisper.cpp then dies with an opaque exit code after
+   * spawning a process, so check the header here and say what is wrong.
+   */
+  const modelProblem = describeModelProblem(modelFile)
+  if (modelProblem) {
+    throw new Error(`${path.basename(modelFile)} cannot be used: ${modelProblem}`)
   }
 
   const outBase = path.join(workspaceLayout().temp, `stt-${Date.now()}`)

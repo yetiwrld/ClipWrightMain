@@ -1,11 +1,25 @@
-/** Small helpers shared by timeline.ts, audio-graph.ts and scene.ts. */
+/**
+ * Small helpers shared by timeline.ts, audio-graph.ts and scene.ts.
+ *
+ * This module used to carry its own copy of `trackIsAudible` — and it disagreed
+ * with the one in timeline.ts: it returned false for every caption, text and
+ * graphic track regardless of mute state. The export path imported *this* copy
+ * while the editor imported the other, so the same project meant two different
+ * things depending on which renderer asked. There is now one implementation and
+ * this file re-exports it.
+ */
 import type { Clip, Project, Track } from './types'
+import { trackIsAudible as audible, isTrackVisible as visible } from './timeline'
 
-export function trackIsAudible(project: Project, track: Track): boolean {
-  if (track.kind === 'caption' || track.kind === 'text' || track.kind === 'graphic') return false
-  const soloed = project.tracks.some((t) => t.solo)
-  if (soloed) return track.solo && !track.muted
-  return !track.muted
+export { trackIsAudible } from './timeline'
+
+export function isTrackVisible(project: Project, track: Track): boolean {
+  return visible(project, track)
+}
+
+/** Kept for callers that only need the audible decision from a track id. */
+export function isTrackAudible(project: Project, track: Track): boolean {
+  return audible(project, track)
 }
 
 export function trackIsVisibleClass(track: Track): boolean {

@@ -14,6 +14,7 @@ import {
   duplicateClip,
   groupClips,
   insertClip,
+  legalPatch,
   moveClip,
   moveTrack as moveTrackOp,
   overwriteClip,
@@ -92,6 +93,17 @@ interface EditorState {
   past: EditorSnapshot[]
   future: EditorSnapshot[]
   clipboard: Clip[]
+  /**
+   * Snapshot of the project as it was when the current gesture began, and the
+   * gesture's own id.
+   *
+   * A drag lasts hundreds of frames. Each frame used to be either a history
+   * write (undo flooded with one entry per frame) or no history at all (the
+   * gesture silently folded into whatever edit came before it, so undo skipped
+   * back past the drag). Neither is right: one gesture must produce exactly one
+   * undo entry, built from the state *before* the first frame moved.
+   */
+  gesture: { id: string; label: string; before: Project } | null
 
   /* actions */
   setProject: (project: Project | null) => void
@@ -104,6 +116,13 @@ interface EditorState {
   toggleClipSelection: (id: string) => void
   selectAllClips: () => void
   clearSelection: () => void
+  /**
+   * Drop selected clip ids that are no longer in the project, and clear the
+   * active track when it has been removed. Every destructive operation calls
+   * this: a selection pointing at a deleted clip made the Inspector show a ghost
+   * and turned the next Delete into a no-op that pushed an empty undo entry.
+   */
+  pruneSelection: () => void
   setActiveTrack: (trackId: string | null) => void
   setZoom: (zoom: number) => void
   zoomBy: (factor: number, anchorMs?: number) => void
@@ -121,9 +140,15 @@ interface EditorState {
   finishTransformDrag: (clipId: string) => void
   setClipTransform: (clipId: string, patch: Partial<Clip['transform']>) => void
   /** Apply a project mutation without recording history (used for drag frames). */
-  applyLive: (mutator: (project: Project) => Project) => void
+  applyLive: (mutator: (project: Project) => Project, label?: string) => void
+  /**
+   * Start (or continue) a named gesture. Repeating the call with the id of the
+   * gesture already in progress is a no-op, so a per-frame caller can pass the
+   * same id every frame without losing the original snapshot.
+   */
+  beginGesture: (id: string, label: string) => void
   /** Push one history snapshot for a finished gesture. */
-  commitHistory: (label: string) => void
+  commitHistory: (label: string, id?: string) => void
   pushClipboard: (clips: Clip[]) => void
   pasteClipboard: () => void
   setSaving: (saving: boolean) => void
@@ -138,6 +163,8 @@ interface EditorState {
 }
 
 const MAX_HISTORY = 60
+/** Monotonic id source for drag/typing gestures (never reused across a session). */
+let gestureCounter = 0
 const DEFAULT_ZOOM = 48 // px per second
 
 export const useEditor = create<EditorState>((set, get) => ({
@@ -169,6 +196,7 @@ export const useEditor = create<EditorState>((set, get) => ({
   past: [],
   future: [],
   clipboard: [],
+  gesture: null,
 
   setProject: (project) =>
     set({
@@ -178,6 +206,8 @@ export const useEditor = create<EditorState>((set, get) => ({
       selectedClipIds: [],
       past: [],
       future: [],
+      clipboard: [],
+      gesture: null,
       dirty: false,
       error: null,
       activeTrackId: project?.tracks.find((t) => t.kind === 'video')?.id ?? null
@@ -198,6 +228,12 @@ export const useEditor = create<EditorState>((set, get) => ({
     set({
       project: { ...next, updatedAt: Date.now() },
       dirty: true,
+      /*
+       * A discrete edit (a menu command, a typed value) ends any gesture that
+       * was still open — otherwise the next drag would silently adopt the stale
+       * snapshot and undo would jump to a state from minutes ago.
+       */
+      gesture: null,
       past: history
         ? [...state.past, { project: state.project, label, at: Date.now() }].slice(-MAX_HISTORY)
         : state.past,
@@ -213,7 +249,8 @@ export const useEditor = create<EditorState>((set, get) => ({
       project: previous.project,
       past: state.past.slice(0, -1),
       future: [{ project: state.project, label: previous.label, at: Date.now() }, ...state.future].slice(0, MAX_HISTORY),
-      dirty: true
+      dirty: true,
+      gesture: null
     })
     get().notify({ kind: 'info', title: `Undo: ${previous.label}` })
   },
@@ -226,7 +263,8 @@ export const useEditor = create<EditorState>((set, get) => ({
       project: next.project,
       past: [...state.past, { project: state.project, label: next.label, at: Date.now() }].slice(-MAX_HISTORY),
       future: state.future.slice(1),
-      dirty: true
+      dirty: true,
+      gesture: null
     })
     get().notify({ kind: 'info', title: `Redo: ${next.label}` })
   },
@@ -246,7 +284,21 @@ export const useEditor = create<EditorState>((set, get) => ({
       set({ playhead: clamp(head, 0, Math.max(end, head)), scrubHeadMs: head })
       return
     }
-    set({ playhead: clamp(value, 0, end), scrubHeadMs: null })
+    const next = clamp(value, 0, end)
+    /*
+     * The playback clock calls this every animation frame. Two rules keep that
+     * cheap and keep the timeline from thrashing:
+     *
+     *  • a tick that does not move the playhead writes nothing — at 60 fps with
+     *    a project that has finished, "nothing changed" was still a store update
+     *    and a full re-render;
+     *  • `scrubHeadMs` is only cleared when it is actually set. Writing
+     *    `scrubHeadMs: null` on every frame replaced the object each time, so
+     *    every selector reading it saw a change 60 times a second even though
+     *    its value never changed.
+     */
+    if (next === state.playhead && state.scrubHeadMs === null) return
+    set(state.scrubHeadMs === null ? { playhead: next } : { playhead: next, scrubHeadMs: null })
   },
 
   setPlaying: (playing) => set({ playing }),
@@ -268,6 +320,21 @@ export const useEditor = create<EditorState>((set, get) => ({
     set((state) => ({ selectedClipIds: state.project?.clips.map((c) => c.id) ?? [] })),
 
   clearSelection: () => set({ selectedClipIds: [], selectedTransition: null }),
+
+  pruneSelection: () => {
+    const state = get()
+    if (!state.project) return
+    const alive = new Set(state.project.clips.map((c) => c.id))
+    const kept = state.selectedClipIds.filter((id) => alive.has(id))
+    const activeGone = state.activeTrackId !== null && !state.project.tracks.some((t) => t.id === state.activeTrackId)
+    if (kept.length === state.selectedClipIds.length && !activeGone) return
+    set({
+      selectedClipIds: kept,
+      activeTrackId: activeGone
+        ? (state.project.tracks.find((t) => t.kind === 'video')?.id ?? state.project.tracks[0]?.id ?? null)
+        : state.activeTrackId
+    })
+  },
 
   setActiveTrack: (trackId) => set({ activeTrackId: trackId }),
 
@@ -345,16 +412,19 @@ export const useEditor = create<EditorState>((set, get) => ({
     if (!state.project) return
     const clip = state.project.clips.find((c) => c.id === clipId)
     if (!clip) return
-    set({
-      past: [...state.past, { project: state.project, label: 'Transform clip', at: Date.now() }].slice(-MAX_HISTORY),
-      future: [],
-      dirty: true
-    })
+    /*
+     * This used to append the *current* project to the history stack, which
+     * means "undo" restored the state the drag had just created — a no-op that
+     * also threw away the redo stack. It now closes the gesture, whose snapshot
+     * is the project as it was before the handle moved.
+     */
+    get().commitHistory('Transform clip')
   },
 
   setClipTransform: (clipId, patch) => {
     const state = get()
     if (!state.project) return
+    const gesture = state.gesture ?? { id: `g${++gestureCounter}`, label: 'Transform clip', before: state.project }
     set({
       project: {
         ...state.project,
@@ -362,11 +432,12 @@ export const useEditor = create<EditorState>((set, get) => ({
           c.id === clipId ? { ...c, transform: { ...c.transform, ...patch } } : c
         )
       },
-      dirty: true
+      dirty: true,
+      gesture
     })
   },
 
-  applyLive: (mutator) => {
+  applyLive: (mutator, label) => {
     const state = get()
     if (!state.project) return
     let next: Project
@@ -377,12 +448,42 @@ export const useEditor = create<EditorState>((set, get) => ({
       return
     }
     if (next === state.project) return
-    set({ project: { ...next, updatedAt: Date.now() }, dirty: true })
+    /*
+     * Record the pre-gesture project the first time a live frame actually
+     * changes something. Doing it here (rather than at pointerdown) means a
+     * click that selects a clip but never moves it leaves no undo entry.
+     */
+    const gesture = state.gesture ?? (label ? { id: `g${++gestureCounter}`, label, before: state.project } : null)
+    set({ project: { ...next, updatedAt: Date.now() }, dirty: true, gesture })
   },
 
-  commitHistory: (label) => {
+  beginGesture: (id, label) => {
+    const state = get()
+    if (!state.project || state.gesture?.id === id) return
+    set({ gesture: { id, label, before: state.project } })
+  },
+
+  commitHistory: (label, id) => {
     const state = get()
     if (!state.project) return
+    const gesture = state.gesture
+    /*
+     * With a gesture in flight, the history entry must contain the project as it
+     * was *before* the gesture, not the mid-drag state that is in the store now.
+     * That is what made undo land in the middle of a drag rather than before it.
+     */
+    if (gesture) {
+      if (id !== undefined && gesture.id !== id) return
+      const moved = gesture.before !== state.project
+      set({
+        past: moved
+          ? [...state.past, { project: gesture.before, label: label || gesture.label, at: Date.now() }].slice(-MAX_HISTORY)
+          : state.past,
+        future: moved ? [] : state.future,
+        gesture: null
+      })
+      return
+    }
     set({
       past: [...state.past, { project: state.project, label, at: Date.now() }].slice(-MAX_HISTORY),
       future: []
@@ -428,23 +529,61 @@ export const useEditor = create<EditorState>((set, get) => ({
 export function useTimelineActions() {
   const { apply, project, selectedClipIds, playhead, setPlayhead } = useEditor()
 
+  /** Track ids that may be edited (everything not locked). */
+  const editableSet = () => {
+    const state = useEditor.getState()
+    return new Set((state.project?.tracks ?? []).filter((t) => !t.locked).map((t) => t.id))
+  }
+
+  /** Selected clip ids that live on an unlocked track. */
+  const deletableIds = () => {
+    const state = useEditor.getState()
+    const allowed = editableSet()
+    return state.project
+      ? state.project.clips.filter((c) => state.selectedClipIds.includes(c.id) && allowed.has(c.trackId)).map((c) => c.id)
+      : []
+  }
+
+  /** Drop selected ids that no longer exist after an operation that deletes. */
+  const pruneSelection = () => useEditor.getState().pruneSelection()
+
   return {
     split: () => {
       if (!project) return
+      const unlocked = editableSet()
+      const splittable = (c: Clip) =>
+        unlocked.has(c.trackId) && playhead > c.start && playhead < c.start + c.duration
       const targets = selectedClipIds.length
-        ? project.clips.filter((c) => selectedClipIds.includes(c.id) && playhead > c.start && playhead < c.start + c.duration)
-        : project.clips.filter((c) => playhead > c.start && playhead < c.start + c.duration)
+        ? project.clips.filter((c) => selectedClipIds.includes(c.id) && splittable(c))
+        : project.clips.filter(splittable)
       if (!targets.length) return false
       apply((p) => targets.reduce((acc, clip) => splitClip(acc, clip.id, playhead), p), 'Split clips')
       return true
     },
     deleteSelected: (ripple = false) => {
       if (!project || !selectedClipIds.length) return
+      /*
+       * Locking a track only stopped drags in the lane. Delete, ripple delete,
+       * split and retime all went straight through, so a locked track was still
+       * editable from the keyboard — the lock was decorative. The lock is
+       * enforced here, at the one place every destructive command passes.
+       */
+      const editable = deletableIds()
+      if (!editable.length) {
+        if (selectedClipIds.length) {
+          useEditor.getState().notify({
+            kind: 'warning',
+            title: 'That track is locked',
+            body: 'Unlock it in the track header to delete clips on it.'
+          })
+        }
+        return
+      }
       apply(
         (p) =>
           ripple
-            ? selectedClipIds.reduce((acc, id) => rippleDeleteOp(acc, id), p)
-            : deleteClips(p, selectedClipIds),
+            ? editable.reduce((acc, id) => rippleDeleteOp(acc, id), p)
+            : deleteClips(p, editable),
         ripple ? 'Ripple delete' : 'Delete clips'
       )
       useEditor.getState().clearSelection()
@@ -462,26 +601,52 @@ export function useTimelineActions() {
     },
     rippleDeleteRange: (start: number, end: number, trackId?: string) => {
       apply((p) => rippleDeleteRange(p, start, end, trackId), 'Ripple delete range')
+      pruneSelection()
     },
     addTrack: (kind: TrackKind, name?: string) => {
       apply((p) => addTrackOp(p, kind, name).project, 'Add track')
     },
     removeTrack: (trackId: string) => {
+      /*
+       * Removing a track deletes the clips on it, but the selection kept their
+       * ids. The Inspector then showed a clip that no longer existed, and the
+       * next Delete/transform command operated on ghost ids (a no-op that also
+       * pushed a useless history entry). Selection and active track are pruned
+       * together with the track.
+       */
       apply((p) => removeTrackOp(p, trackId), 'Remove track')
+      useEditor.getState().pruneSelection()
     },
     moveTrack: (trackId: string, direction: -1 | 1) => {
       apply((p) => moveTrackOp(p, trackId, direction), 'Reorder tracks')
     },
-    updateTrack: (trackId: string, patch: Partial<Track>) => {
+    updateTrack: (trackId: string, patch: Partial<Track>, opts?: { history?: boolean; label?: string }) => {
+      /*
+       * Track changes were recorded with `history: false`, which made mute, solo,
+       * lock, the eye toggle and renaming permanently un-undoable — a locked-out
+       * track or a hidden overlay could not be brought back with Ctrl+Z.
+       *
+       * The reason it was excluded is real, though: the name field and the
+       * height handle fire on every keystroke and every pointer frame. Those two
+       * now go through a gesture (see Timeline), so a discrete toggle can record
+       * history normally while a continuous control still produces one entry.
+       */
       apply(
         (p) => ({ ...p, tracks: p.tracks.map((t) => (t.id === trackId ? { ...t, ...patch } : t)) }),
-        'Update track',
-        { history: false }
+        opts?.label ?? 'Update track',
+        { history: opts?.history ?? true }
       )
     },
     updateClip: (clipId: string, patch: Partial<Clip>, opts?: { history?: boolean; label?: string }) => {
+      /*
+       * Timing is normalised here rather than at each call site: this is the one
+       * sink every programmatic clip write goes through, and it used to accept
+       * whatever it was handed — including `duration: -4000` from a typed value,
+       * which produced a clip that existed but could never be drawn.
+       */
+      const safe = legalPatch(patch)
       apply(
-        (p) => ({ ...p, clips: p.clips.map((c) => (c.id === clipId ? { ...c, ...patch } : c)) }),
+        (p) => ({ ...p, clips: p.clips.map((c) => (c.id === clipId ? { ...c, ...safe } : c)) }),
         opts?.label ?? 'Update clip',
         { history: opts?.history ?? false }
       )
@@ -531,8 +696,16 @@ export function useTimelineActions() {
         future: []
       })
     },
-    trim: (clipId: string, edge: 'start' | 'end', time: number, ripple = false) => {
-      apply((p) => trimClip(p, clipId, edge, time, { ripple }), ripple ? 'Ripple trim' : 'Trim clip')
+    trim: (clipId: string, edge: 'start' | 'end', time: number, ripple = false, live = false) => {
+      /*
+       * A trim drag calls this on every pointermove. Each call used to be a full
+       * `apply`, so one drag wrote ~60 undo entries and the redo stack was
+       * cleared 60 times. `live` routes the frame through the gesture instead:
+       * one snapshot for the whole drag, committed on pointerup.
+       */
+      const mutator = (p: Project) => trimClip(p, clipId, edge, time, { ripple })
+      if (live) useEditor.getState().applyLive(mutator, ripple ? 'Ripple trim' : 'Trim clip')
+      else apply(mutator, ripple ? 'Ripple trim' : 'Trim clip')
     },
     placeClip: (clip: Clip, at: number, mode: 'overwrite' | 'insert' = 'overwrite') => {
       apply(

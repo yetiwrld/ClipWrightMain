@@ -10,7 +10,8 @@
  * whatever is beneath it on the timeline. Both renderers implement exactly that.
  */
 import { resolveClipProps } from './keyframes'
-import { effectSpeed, trackIsAudible } from './timeline-helpers'
+import { effectSpeed } from './timeline-helpers'
+import { isTrackVisible, trackIsAudible } from './timeline'
 import { clamp } from './time'
 import type {
   AnimatableProp,
@@ -128,6 +129,28 @@ export function transitionAlpha(
 }
 
 /**
+ * The same curve as `transitionAlpha`, expressed as an ffmpeg expression.
+ *
+ * The exporter used to emit a plain `fade`, i.e. a linear ramp, for every
+ * transition. The preview curves `fadeToBlack`/`fadeFromBlack` with a 1.4 power
+ * and `dissolve` with a smoothstep, so the two renderers disagreed on every
+ * mid-transition frame and an export never quite matched what the user
+ * approved in the monitor. `p` is progress from 0 to 1; the caller passes the
+ * frame's own progress expression.
+ */
+export function transitionAlphaExpr(type: string, p: string, direction: 'in' | 'out'): string {
+  switch (type) {
+    case 'fadeToBlack':
+    case 'fadeFromBlack':
+      return direction === 'in' ? `pow(${p}\\,1.4)` : `pow(1-(${p})\\,1.4)`
+    case 'dissolve':
+      return `(${p})*(${p})*(3-2*(${p}))`
+    default:
+      return p
+  }
+}
+
+/**
  * Clips bucketed by track and sorted by start time, cached per project object.
  *
  * buildScene runs once per preview frame, and it used to filter and re-sort the
@@ -231,21 +254,53 @@ function makeLayer(
   }
 }
 
+/**
+ * Indexed lookups for hot paths.
+ *
+ * `buildScene` was fixed to cache its clip buckets per project, but the renderers
+ * that consume the scene still looked every layer up with `Array.find` — once
+ * per layer, per segment, plus once per clip in the audio mix. On a project with
+ * a few hundred clips that is several thousand linear scans per export, and the
+ * preview did the same for every asset on every frame.
+ *
+ * The index is keyed on the project object, which the store replaces on every
+ * edit, so it can never go stale.
+ */
+export interface ProjectIndex {
+  clips: Map<string, Clip>
+  assets: Map<string, Project['assets'][number]>
+  tracks: Map<string, Project['tracks'][number]>
+}
+
+const indexCache = new WeakMap<Project, ProjectIndex>()
+
+export function projectIndex(project: Project): ProjectIndex {
+  const cached = indexCache.get(project)
+  if (cached) return cached
+  const index: ProjectIndex = {
+    clips: new Map(project.clips.map((c) => [c.id, c])),
+    assets: new Map(project.assets.map((a) => [a.id, a])),
+    tracks: new Map(project.tracks.map((t) => [t.id, t]))
+  }
+  indexCache.set(project, index)
+  return index
+}
+
 /** Build the scene at a moment in time. Layers are ordered bottom-up. */
 export function buildScene(project: Project, time: number): Scene {
   const layers: SceneLayer[] = []
-  const soloed = project.tracks.some((t) => t.solo)
   // project.tracks is stored top-first for overlays; composite bottom-up.
   const ordered = [...project.tracks].reverse()
   for (const track of ordered) {
-    if (!track.visible) continue
-    if ((track.kind as string) === 'audio') continue
     /*
-     * Soloing is "only this track". The kind test here used to exclude captions,
-     * text and graphics, so soloing a video track still drew every caption over
-     * it — the opposite of what the button says.
+     * One predicate decides what reaches the canvas. Solo, mute and the eye
+     * toggle used to be re-implemented here (and differently from the timeline
+     * header, the exporter and the audio mix), so the four disagreed about
+     * captions. `isTrackVisible` is the single answer, and the exporter now
+     * calls the same function.
      */
-    if (soloed && !track.solo) continue
+    if ((track.kind as string) === 'audio') continue
+    if (!isTrackVisible(project, track)) continue
     layers.push(...buildLayers(project, track, time))
   }
   return {
@@ -272,4 +327,11 @@ export function isTrackAudible(project: Project, trackId: string): boolean {
   const track = project.tracks.find((t) => t.id === trackId)
   if (!track) return false
   return trackIsAudible(project, track)
+}
+
+/** Is this track drawn at all (respecting the eye toggle and solo)? */
+export function isTrackDrawn(project: Project, trackId: string): boolean {
+  const track = project.tracks.find((t) => t.id === trackId)
+  if (!track) return false
+  return isTrackVisible(project, track)
 }

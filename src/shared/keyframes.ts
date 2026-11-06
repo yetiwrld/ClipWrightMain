@@ -94,6 +94,33 @@ export function clampCropPair(a: number, b: number, max = 0.98): [number, number
   return [left * scale, right * scale]
 }
 
+/**
+ * Re-anchor a keyframe track after a clip has been cut at `cut` ms.
+ *
+ * The kept tail starts at the cut, so its local time is `t - cut`. Simply
+ * subtracting the cut and clamping at zero — which is what a head trim does —
+ * keeps the *old* first keyframe's value at the new start, so an animation jumps
+ * at the cut. Here the value at the cut is sampled from the original curve and
+ * used as the tail's opening keyframe, so the motion continues exactly where it
+ * left off.
+ */
+export function sliceTrack(track: Keyframe[] | undefined, cut: number): Keyframe[] | undefined {
+  if (!track || track.length === 0) return track
+  if (cut <= 0) return track.map((k) => ({ ...k }))
+  const boundary = sampleTrack(track, cut)
+  const kept = track.filter((k) => k.t > cut).map((k) => ({ ...k, t: k.t - cut }))
+  if (boundary === null) return kept
+  // Reuse the easing of the segment the cut landed in so the curve shape holds.
+  const outgoing = [...track].reverse().find((k) => k.t <= cut)
+  const head: Keyframe = {
+    id: `kf_cut_${Math.round(cut)}`,
+    t: 0,
+    value: boundary,
+    easing: outgoing?.easing ?? kept[0]?.easing ?? { kind: 'linear' }
+  }
+  return [head, ...kept]
+}
+
 export function addKeyframe(
   tracks: KeyframeTracks,
   prop: AnimatableProp,

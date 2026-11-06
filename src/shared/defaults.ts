@@ -1,4 +1,4 @@
-import { baseClip, defaultTracks } from './timeline'
+import { baseClip, defaultTracks, ensureTrack, legalDuration } from './timeline'
 import { canvasSizeFor } from './presets'
 import type { Project, Settings } from './types'
 
@@ -108,14 +108,17 @@ export function createClipProject(opts: {
   start: number
   duration: number
 }): Project {
-  const project = createProject(opts.name, opts.aspect, opts.fps)
-  const videoTrack = project.tracks.find((t) => t.kind === 'video')!
+  let project = createProject(opts.name, opts.aspect, opts.fps)
   if (opts.assetId) {
-    const clip = baseClip('video', videoTrack.id, opts.name)
+    // Created on demand: `createProject` owns the default track list, and a
+    // non-null assertion here breaks silently the day that list changes.
+    const ensured = ensureTrack(project, 'video', 'Video 1')
+    project = ensured.project
+    const clip = baseClip('video', ensured.track.id, opts.name)
     clip.assetId = opts.assetId
     clip.start = 0
-    clip.duration = opts.duration
-    clip.sourceIn = opts.start
+    clip.duration = legalDuration(opts.duration)
+    clip.sourceIn = Math.max(0, opts.start)
     project.clips.push(clip)
   }
   return project

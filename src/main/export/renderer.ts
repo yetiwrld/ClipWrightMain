@@ -15,8 +15,9 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { buildScene, type SceneLayer } from '@shared/scene'
-import { effectSpeed, trackIsAudible } from '@shared/timeline-helpers'
+import { buildScene, projectIndex, transitionAlphaExpr, type SceneLayer } from '@shared/scene'
+import { effectSpeed } from '@shared/timeline-helpers'
+import { trackIsAudible } from '@shared/timeline'
 import { clampCropPair, sampleTrack } from '@shared/keyframes'
 import type { Clip, ExportPreset, Project } from '@shared/types'
 import { toFfmpegColour } from '@shared/colour'
@@ -314,7 +315,7 @@ export class ProjectRenderer {
     )
 
     for (const layer of visualLayers) {
-      const asset = project.assets.find((a) => a.id === layer.assetId)
+      const asset = projectIndex(project).assets.get(layer.assetId ?? '')
       if (!asset) {
         this.warnings.push(`A clip references missing media and was skipped: ${layer.name}`)
         continue
@@ -323,7 +324,7 @@ export class ProjectRenderer {
         this.warnings.push(`Media file not found and was skipped: ${asset.path}`)
         continue
       }
-      const clip = project.clips.find((c) => c.id === layer.id)!
+      const clip = projectIndex(project).clips.get(layer.id)!
       const isImage = asset.kind === 'image' || IMAGE_EXT.test(asset.path)
       const speed = effectSpeed(clip)
       const segStartInClip = part.start - clip.start
@@ -414,7 +415,7 @@ export class ProjectRenderer {
       cardChain.push('format=rgba')
 
       // Alpha: static opacity + track opacity + keyframes + transitions.
-      const track = project.tracks.find((t) => t.id === clip.trackId)
+      const track = projectIndex(project).tracks.get(clip.trackId)
       const staticAlpha = Math.min(1, Math.max(0, layer.transform.opacity * (track?.opacity ?? 1)))
       const keyedOpacity = anim.opacity
       const transitions = transitionSteps(project, clip, part, segDur)
@@ -463,7 +464,7 @@ export class ProjectRenderer {
       }
       for (const layer of scene.layers) {
         if (!layer.hidden && (layer.kind === 'text' || layer.kind === 'caption')) {
-          const clip = project.clips.find((c) => c.id === layer.id)
+          const clip = projectIndex(project).clips.get(layer.id)
           if (!clip) continue
           const from = Math.max(0, (clip.start - part.start) / 1000)
           const to = Math.min(segDur, (clip.start + clip.duration - part.start) / 1000)
@@ -605,21 +606,70 @@ function lastLines(text: string): string {
     .slice(0, 600)
 }
 
-/** Alpha fade steps for transition-in and transition-out parts. */
+/**
+ * Alpha fade steps for transition-in and transition-out parts.
+ *
+ * These must describe the same curve as `transitionAlpha` in @shared/scene,
+ * because the preview draws from that function. A plain `fade` filter (linear)
+ * was emitted for every preset, so a `fadeToBlack` or `dissolve` clip crossed
+ * the transition at a visibly different rate in the exported file than in the
+ * monitor the user approved. The alpha channel is multiplied by an expression
+ * built from the shared curve instead.
+ */
 function transitionSteps(project: Project, clip: Clip, part: Part, segDur: number): string[] {
   const steps: string[] = []
   const inDur = clip.transitionIn ? Math.min(clip.transitionIn.durationMs, clip.duration) : 0
   const outDur = clip.transitionOut ? Math.min(clip.transitionOut.durationMs, clip.duration) : 0
   if (inDur > 0 && part.start < clip.start) {
     const fadeDur = Math.min(segDur, (clip.start - part.start) / 1000)
-    if (fadeDur > 0.005) steps.push(`fade=t=in:st=0:d=${fadeDur.toFixed(3)}:alpha=1`)
+    if (fadeDur > 0.005) {
+      steps.push(alphaFadeStep(clip.transitionIn!.type, 0, fadeDur, 'in'))
+    }
   }
   if (outDur > 0 && part.end > clip.start + clip.duration) {
     const fadeStart = Math.max(0, (clip.start + clip.duration - part.start) / 1000)
     const fadeDur = Math.max(0, Math.min(segDur - fadeStart, (part.end - (clip.start + clip.duration)) / 1000))
-    if (fadeDur > 0.005) steps.push(`fade=t=out:st=${fadeStart.toFixed(3)}:d=${fadeDur.toFixed(3)}:alpha=1`)
+    if (fadeDur > 0.005) {
+      steps.push(alphaFadeStep(clip.transitionOut!.type, fadeStart, fadeDur, 'out'))
+    }
   }
   return steps
+}
+
+/**
+ * One alpha ramp as a geq expression, or a plain `fade` when the curve is
+ * linear (cheaper, and exactly equivalent).
+ *
+ * geq clamps to the working pixel format, so [0,1] map onto the alpha channel
+ * directly.
+ */
+export function alphaFadeStep(
+  type: string,
+  startSec: number,
+  durationSec: number,
+  direction: 'in' | 'out'
+): string {
+  if (type !== 'fadeToBlack' && type !== 'fadeFromBlack' && type !== 'dissolve') {
+    // Linear: `fade … alpha=1` is precisely transitionAlpha's default branch.
+    return direction === 'in'
+      ? `fade=t=in:st=${startSec.toFixed(3)}:d=${durationSec.toFixed(3)}:alpha=1`
+      : `fade=t=out:st=${startSec.toFixed(3)}:d=${durationSec.toFixed(3)}:alpha=1`
+  }
+  /*
+   * Progress 0→1 across this ramp, as an ffmpeg expression.
+   *
+   * Two ffmpeg details are load-bearing and were measured, not guessed:
+   *   • geq's time variable is uppercase `T`, in seconds. Lowercase `t` is not
+   *     defined and the filter aborts with "Undefined constant".
+   *   • a comma inside a filter option value ends the option list, so function
+   *     arguments need `\,`. Escaping with `\\,` (the graph-level form) is what
+   *     produced "missing '('" here.
+   * The bottom edge is clamped; the top edge cannot be exceeded because the
+   * ramp only exists inside its own segment.
+   */
+  const p = `max(0\\,(T-${startSec.toFixed(3)})/${durationSec.toFixed(3)})`
+  const curve = transitionAlphaExpr(type, p, direction)
+  return `geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*(${curve})'`
 }
 
 /** Audio mix graph: every audible clip trimmed, faded, delayed and summed. */

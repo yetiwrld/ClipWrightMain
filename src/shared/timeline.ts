@@ -2,12 +2,56 @@
  * Timeline operations. Every mutation returns a new project (immutable) so the
  * editor can keep a reliable undo/redo history and so exports are deterministic.
  */
-import { uid } from './keyframes'
+import { sliceTrack, uid } from './keyframes'
 import { clamp, snapToFrame } from './time'
 import type { Clip, ClipKind, Project, Track, TrackKind } from './types'
 
 export const DEFAULT_TRACK_HEIGHT = 64
-export const MIN_CLIP_DURATION = 80
+
+/**
+ * Shortest clip the timeline will produce, in milliseconds.
+ *
+ * The unit matters: 80 ms is shorter than a frame at any common rate, so every
+ * clamp that used this constant let a clip collapse to something no renderer
+ * could show. It is now two frames at 30 fps — the shortest span that still
+ * survives rounding to a frame boundary during a trim.
+ */
+export const MIN_CLIP_DURATION = 66
+
+/**
+ * Shortest clip a manual retime may produce. Deliberately coarser than
+ * MIN_CLIP_DURATION: a human typing a duration wants a usable clip, while the
+ * trim/split math only needs to stay above a frame.
+ */
+export const MIN_AUTHORED_DURATION = 100
+
+/**
+ * Coerce an externally supplied duration into a legal clip length.
+ *
+ * Every writer went through no validation at all, so a negative or NaN duration
+ * (typed into the Inspector, or arriving from an import) produced a clip with
+ * `duration: -4000` — which breaks selection, ripple math and the renderer's
+ * segment splitting while looking like a perfectly normal clip in the UI.
+ */
+export function legalDuration(value: number | undefined | null, minimum = MIN_CLIP_DURATION): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return minimum
+  return Math.max(minimum, Math.round(value))
+}
+
+/**
+ * Coerce a `Partial<Clip>` patch so it can never carry an illegal timing value.
+ *
+ * `start` and `sourceIn` are clamped at zero: a negative start is not "before
+ * the timeline", it is a clip the renderer drops silently, and a negative
+ * `sourceIn` reads before the first frame of the media file.
+ */
+export function legalPatch(patch: Partial<Clip>): Partial<Clip> {
+  const out: Partial<Clip> = { ...patch }
+  if (out.duration !== undefined) out.duration = legalDuration(out.duration)
+  if (out.start !== undefined) out.start = Math.max(0, Number.isFinite(out.start) ? out.start : 0)
+  if (out.sourceIn !== undefined) out.sourceIn = Math.max(0, Number.isFinite(out.sourceIn) ? out.sourceIn : 0)
+  return out
+}
 
 export function projectDuration(project: Project): number {
   return project.clips.reduce((max, c) => Math.max(max, c.start + c.duration), 0)
@@ -32,6 +76,13 @@ export function findTrack(project: Project, trackId: string): Track | undefined 
  */
 export function isTrackVisible(project: Project, track: Track): boolean {
   if (!track.visible) return false
+  /*
+   * Soloing used to be enforced only for audio and only inside buildScene's
+   * inline copy of this logic, so hiding the eye icon on a soloed-but-muted
+   * track had no effect on the canvas while muting it did.
+   */
+  const soloed = project.tracks.some((t) => t.solo)
+  if (soloed && !track.solo) return false
   if (track.kind === 'audio') return !track.muted
   return true
 }
@@ -168,11 +219,20 @@ export function findFreeSlot(
   return pos
 }
 
-/** Remove overlapping clips entirely (overwrite edit). */
+/**
+ * Overwrite a range on a track.
+ *
+ * This used to *delete* every clip the range touched, while `overwriteClip` —
+ * the function that actually implements the user-facing overwrite edit — calls
+ * `clearRange`, which trims instead. Two functions named "overwrite" with
+ * opposite destructive behaviour is exactly the kind of thing that turns a
+ * dropped clip into a lost take. There is now one behaviour: trim what the range
+ * covers, never delete media the range does not reach.
+ *
+ * @deprecated use `clearRange`; kept so older callers keep compiling.
+ */
 export function overwriteRange(clips: Clip[], trackId: string, start: number, end: number, ignoreId?: string): Clip[] {
-  return clips.filter(
-    (c) => !(c.trackId === trackId && c.id !== ignoreId && start < c.start + c.duration && end > c.start)
-  )
+  return clearRange(clips, trackId, start, end, ignoreId)
 }
 
 /**
@@ -180,6 +240,16 @@ export function overwriteRange(clips: Clip[], trackId: string, start: number, en
  * without destroying neighbouring media). Used by insert edits.
  */
 export function clearRange(clips: Clip[], trackId: string, start: number, end: number, ignoreId?: string): Clip[] {
+  /*
+   * An inverted or empty range used to fall through every branch and, in the
+   * "range is in the middle" case, produce two clips that both covered the same
+   * media. A range is half-open and always ordered; anything else is a caller
+   * bug, and doing nothing is the only safe answer.
+   */
+  const from = Math.min(start, end)
+  const to = Math.max(start, end)
+  if (!(to > from)) return [...clips]
+
   const out: Clip[] = []
   for (const c of clips) {
     if (c.trackId !== trackId || c.id === ignoreId) {
@@ -188,36 +258,61 @@ export function clearRange(clips: Clip[], trackId: string, start: number, end: n
     }
     const cStart = c.start
     const cEnd = c.start + c.duration
-    if (cEnd <= start || cStart >= end) {
+    if (cEnd <= from || cStart >= to) {
       out.push(c)
       continue
     }
     // Clip completely covered.
-    if (cStart >= start && cEnd <= end) continue
+    if (cStart >= from && cEnd <= to) continue
     // Clip straddles the start of the range: keep the head.
-    if (cStart < start && cEnd <= end) {
-      out.push({ ...c, duration: start - cStart })
+    if (cStart < from && cEnd <= to) {
+      const head = from - cStart
+      // A head shorter than the minimum clip length is not a clip: drop it
+      // rather than leaving a 3 ms sliver the user can neither see nor drag.
+      if (head >= MIN_CLIP_DURATION) out.push({ ...c, duration: head })
       continue
     }
     // Clip straddles the end of the range: keep the tail.
-    if (cStart >= start && cEnd > end) {
-      const cut = end - cStart
-      out.push({ ...c, start: end, duration: cEnd - end, sourceIn: c.sourceIn + cut })
+    if (cStart >= from && cEnd > to) {
+      const cut = to - cStart
+      const tail = cEnd - to
+      if (tail >= MIN_CLIP_DURATION) {
+        out.push(splitTail(c, to, cut, tail))
+      }
       continue
     }
     // Range is in the middle of the clip: split and keep both sides.
-    const headDuration = start - cStart
-    const tailOffset = end - cStart
-    out.push({ ...c, duration: headDuration })
-    out.push({
-      ...c,
-      id: uid('clip'),
-      start: end,
-      duration: cEnd - end,
-      sourceIn: c.sourceIn + tailOffset
-    })
+    const headDuration = from - cStart
+    const cut = to - cStart
+    const tailDuration = cEnd - to
+    if (headDuration >= MIN_CLIP_DURATION) out.push({ ...c, duration: headDuration })
+    if (tailDuration >= MIN_CLIP_DURATION) out.push(splitTail(c, to, cut, tailDuration))
   }
   return out.sort((a, b) => a.start - b.start)
+}
+
+/**
+ * The right-hand part of a clip cut at a later point in time.
+ *
+ * Keyframes are clip-local, so the new half must shift them by the cut, exactly
+ * as a head trim does — otherwise the animation restarts on the second half of
+ * every split clip. (`words` are absolute timeline times, so they need no shift.)
+ */
+function splitTail(clip: Clip, newStart: number, cut: number, duration: number): Clip {
+  const keyframes: Clip['keyframes'] = {}
+  for (const key of Object.keys(clip.keyframes) as (keyof Clip['keyframes'])[]) {
+    const sliced = sliceTrack(clip.keyframes[key], cut)
+    if (sliced && sliced.length) keyframes[key] = sliced
+  }
+  return {
+    ...clip,
+    id: uid('clip'),
+    start: newStart,
+    duration,
+    sourceIn: clip.sourceIn + cut,
+    keyframes,
+    transitionIn: undefined
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -228,15 +323,13 @@ export function splitClip(project: Project, clipId: string, atTime: number): Pro
   const clip = findClip(project, clipId)
   if (!clip) return project
   const local = atTime - clip.start
-  if (local <= MIN_CLIP_DURATION || local >= clip.duration - MIN_CLIP_DURATION) return project
-  const right: Clip = {
-    ...clip,
-    id: uid('clip'),
-    start: atTime,
-    duration: clip.duration - local,
-    sourceIn: clip.sourceIn + local,
-    transitionIn: undefined
-  }
+  if (local < MIN_CLIP_DURATION || clip.duration - local < MIN_CLIP_DURATION) return project
+  /*
+   * The right half keeps its position on the timeline but starts its animation
+   * from the cut, so its keyframes are shifted back by `local`. Splitting an
+   * animated clip used to replay the whole motion on the second half.
+   */
+  const right: Clip = splitTail(clip, atTime, local, clip.duration - local)
   const left: Clip = { ...clip, duration: local, transitionOut: undefined }
   return {
     ...project,
@@ -348,47 +441,87 @@ export function rippleDelete(project: Project, clipId: string): Project {
   const clip = findClip(project, clipId)
   if (!clip) return project
   const gap = clip.duration
+  const from = clip.start
+  const to = clip.start + clip.duration
   const clips = project.clips
     .filter((c) => c.id !== clipId)
     .map((c) =>
-      c.trackId === clip.trackId && c.start >= clip.start + clip.duration - 1
-        ? { ...c, start: Math.max(0, c.start - gap) }
-        : c
+      c.trackId === clip.trackId && c.start >= to - 1 ? { ...c, start: Math.max(0, c.start - gap) } : c
     )
-  return { ...project, clips }
+  const markers = (project.markers ?? []).flatMap((m) => {
+    if (m.time >= to - 1) return [{ ...m, time: Math.max(0, m.time - gap) }]
+    if (m.time >= from) return []
+    return [m]
+  })
+  return { ...project, clips, markers }
 }
 
 /** Ripple delete an arbitrary time range across one track or all tracks. */
 export function rippleDeleteRange(project: Project, start: number, end: number, trackId?: string): Project {
-  const span = Math.max(0, end - start)
+  const from = Math.min(start, end)
+  const to = Math.max(start, end)
+  const span = Math.max(0, to - from)
   let clips = project.clips
   for (const track of project.tracks) {
     if (trackId && track.id !== trackId) continue
-    clips = clearRange(clips, track.id, start, end)
+    clips = clearRange(clips, track.id, from, to)
   }
   clips = clips.map((c) =>
-    (!trackId || c.trackId === trackId) && c.start >= end - 1 ? { ...c, start: Math.max(0, c.start - span) } : c
+    (!trackId || c.trackId === trackId) && c.start >= to - 1 ? { ...c, start: Math.max(0, c.start - span) } : c
   )
-  return { ...project, clips }
+  /*
+   * Rippling used to leave markers behind, pointing at a moment that had just
+   * been removed, so every marker after the cut was off by the deleted span.
+   */
+  const markers = (project.markers ?? []).flatMap((m) => {
+    if (m.time >= to - 1) return [{ ...m, time: Math.max(0, m.time - span) }]
+    if (m.time >= from) return []
+    return [m]
+  })
+  return { ...project, clips, markers }
 }
 
-/** Insert edit: push everything on the track right before placing a clip. */
+/**
+ * Insert edit: push everything on the track right before placing a clip.
+ *
+ * The push only moved clips that *began* at or after the insertion point. A clip
+ * straddling that point (it starts before, ends after) was left alone, so the
+ * new clip was then laid on top of it — an insert edit that silently produced an
+ * overlap. The straddling clip is now cut at the insertion point and only its
+ * tail moves right.
+ */
 export function insertClip(project: Project, clip: Clip, at: number): Project {
-  const clips = project.clips.map((c) =>
-    c.trackId === clip.trackId && c.start >= at - 1
-      ? { ...c, start: c.start + clip.duration }
-      : c
-  )
-  clips.push({ ...clip, start: at })
-  return { ...project, clips }
+  const duration = legalDuration(clip.duration)
+  const shifted = project.clips.flatMap((c) => {
+    if (c.trackId !== clip.trackId) return [c]
+    const end = c.start + c.duration
+    if (c.start >= at - 1) return [{ ...c, start: c.start + duration }]
+    if (end <= at + 1) return [c]
+    // Straddles the insertion point: keep the head in place, move the tail.
+    const headDuration = at - c.start
+    const tailDuration = end - at
+    const parts: Clip[] = []
+    if (headDuration >= MIN_CLIP_DURATION) parts.push({ ...c, duration: headDuration, transitionOut: undefined })
+    if (tailDuration >= MIN_CLIP_DURATION) {
+      parts.push({ ...splitTail(c, at + duration, headDuration, tailDuration), transitionOut: c.transitionOut })
+    }
+    return parts
+  })
+  return { ...project, clips: [...shifted, { ...clip, start: at, duration }] }
 }
 
 /** Overwrite edit: place a clip, clearing anything underneath it. */
 export function overwriteClip(project: Project, clip: Clip, at: number): Project {
-  const placed = { ...clip, start: at }
+  const placed = { ...clip, start: Math.max(0, at), duration: legalDuration(clip.duration) }
   const clips = project.clips.filter((c) => c.id !== placed.id)
-  const cleared = clearRange(clips, placed.trackId, at, at + placed.duration, placed.id)
-  return { ...project, clips: [...cleared, placed] }
+  const cleared = clearRange(clips, placed.trackId, placed.start, placed.start + placed.duration, placed.id)
+  // The overwritten range also removes any markers that were sitting on it,
+  // which is what "overwrite" means for a marker: the moment it pointed at is
+  // gone. Markers outside the range keep their time.
+  const markers = (project.markers ?? []).filter(
+    (m) => !(m.time >= placed.start && m.time < placed.start + placed.duration)
+  )
+  return { ...project, clips: [...cleared, placed], markers }
 }
 
 export function duplicateClip(project: Project, clipId: string): { project: Project; newId?: string } {
@@ -485,6 +618,26 @@ function labelFor(kind: TrackKind): string {
     case 'image':
       return 'Images'
   }
+}
+
+/**
+ * Find the first track of a kind, or add one.
+ *
+ * Callers used to write `project.tracks.find(t => t.kind === 'caption')!` and
+ * then dereference it. That assertion is a promise the project structure cannot
+ * keep: any project saved before caption tracks existed, or one where the user
+ * deleted the caption track, makes it undefined — and the crash lands in the
+ * middle of clip generation, after the project has already been created.
+ */
+export function ensureTrack(
+  project: Project,
+  kind: TrackKind,
+  name?: string
+): { project: Project; track: Track; created: boolean } {
+  const existing = project.tracks.find((t) => t.kind === kind)
+  if (existing) return { project, track: existing, created: false }
+  const added = addTrack(project, kind, name)
+  return { project: added.project, track: added.track, created: true }
 }
 
 export function removeTrack(project: Project, trackId: string): Project {

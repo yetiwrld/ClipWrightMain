@@ -429,6 +429,18 @@
 .timeline__track--locked .timeline__lane {
   opacity: 0.7;
 }
+/*
+ * Hidden or solo-excluded tracks are not in the exported frame. The lane dims so
+ * the timeline agrees with the monitor instead of showing media that will never
+ * be rendered.
+ */
+.timeline__track--dimmed .timeline__lane {
+  opacity: 0.38;
+  filter: saturate(0.4);
+}
+.timeline__track--dimmed .timeline__header {
+  opacity: 0.7;
+}
 .timeline__track--drop .timeline__lane {
   background: color-mix(in srgb, var(--brand) 8%, transparent);
 }
