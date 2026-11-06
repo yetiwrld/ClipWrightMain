@@ -1,0 +1,41 @@
+name: CI
+
+# Fast feedback on every branch: types and tests only, no packaging.
+on:
+  push:
+    branches-ignore:
+      - 'dependabot/**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck & tests (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install ffmpeg (the render tests encode for real)
+        run: |
+          choco install ffmpeg -y --no-progress
+          ffmpeg -version
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
+
+      - name: Build (catches import/bundling mistakes that types miss)
+        run: npm run build

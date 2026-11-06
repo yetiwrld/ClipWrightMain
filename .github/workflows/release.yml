@@ -85,7 +85,7 @@ jobs:
         run: npm run build
 
       - name: Package (NSIS installer + portable exe)
-        run: npx electron-builder --win --x64 --publish never
+        run: npx electron-builder --win --x64 --publish never --config electron-builder.config.cjs
         env:
           # Signing is optional. When the secrets are absent the build is
           # unsigned and the release notes say so.
