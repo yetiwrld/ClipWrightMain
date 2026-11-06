@@ -100,6 +100,10 @@ export function registerHandlers(windowGetter: () => BrowserWindow | null): void
     await shell.openPath(workspaceLayout().logs)
   })
   ipcMain.handle(IPC.app.readLogs, (_e, lines?: number) => readLogTail(lines ?? 400))
+  ipcMain.handle(IPC.app.quit, () => {
+    // Give the settings store and the ffmpeg runner a chance to shut down.
+    app.quit()
+  })
   ipcMain.handle(IPC.app.openPath, async (_e, target: string) => {
     const error = await shell.openPath(target)
     return { ok: !error, error: error || undefined }

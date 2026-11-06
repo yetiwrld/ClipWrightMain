@@ -154,7 +154,10 @@ export function readLogTail(lines = 400): { text: string; file: string; bytes: n
     fs.closeSync(handle)
   }
   const text = buffer.toString('utf8')
+  // Split on newlines, dropping the trailing empty segment a final newline leaves
+  // behind so "last 10 lines" really means ten lines of content.
   const split = text.split('\n')
+  if (split[split.length - 1] === '') split.pop()
   // The first line of a mid-file slice is usually partial; drop it.
   if (chunk < size) split.shift()
   return { text: split.slice(-lines).join('\n'), file, bytes: size }

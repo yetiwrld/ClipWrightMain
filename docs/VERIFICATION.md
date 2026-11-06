@@ -9,7 +9,7 @@ policy here), no GitHub/npm network beyond the registry, no `root` for `apt`.
 That single constraint is why packaging and the ffmpeg-dependent tests run in CI
 rather than locally.
 
-## 1. Automated tests — 45 passed, 9 skipped
+## 1. Automated tests — 48 passed, 9 skipped
 
 `npm test` (vitest, single fork, node environment).
 
@@ -19,6 +19,7 @@ rather than locally.
 | `tests/ui.test.tsx` | 16 | renderer boot, onboarding, editor components (jsdom) |
 | `tests/packages.test.ts` | 4 | `.clipwright` export/import round-trip |
 | `tests/open-package.test.ts` | 3 | file-association argument parsing |
+| `tests/logs.test.ts` | 3 | log tail reading (line window, empty file, live writes) |
 | `tests/render.test.ts` | 9 | **skipped here** — requires a working ffmpeg; runs in CI |
 
 Specific invariants asserted (not smoke tests):

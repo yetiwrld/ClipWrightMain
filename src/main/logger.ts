@@ -2,30 +2,47 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { logsDir } from './workspace'
 
-/** Simple rotating file logger. Never logs credentials or media contents. */
+/**
+ * Simple rotating file logger. Never logs credentials or media contents.
+ *
+ * Lines are appended synchronously: log volume is low (a few lines per action,
+ * not per frame) and a synchronous append means the last line before a crash is
+ * actually on disk — which is the whole point of a diagnostic log. The file is
+ * re-resolved on every write so changing the workspace in Settings moves logging
+ * with it instead of leaving it pinned to the old folder.
+ */
 type Level = 'info' | 'warn' | 'error' | 'debug'
 
-class Logger {
-  private stream: fs.WriteStream | null = null
-  private file = ''
-  private maxBytes = 4 * 1024 * 1024
+const MAX_BYTES = 4 * 1024 * 1024
+const ROTATE_CHECK_EVERY = 64
 
-  private ensure(): void {
-    if (this.stream) return
+class Logger {
+  private dir = ''
+  private file = ''
+  private writes = 0
+
+  /** Resolve the active log file, rotating it when it has grown too large. */
+  private target(): string | null {
     try {
       const dir = logsDir()
-      this.file = path.join(dir, 'clipwright.log')
-      if (fs.existsSync(this.file) && fs.statSync(this.file).size > this.maxBytes) {
-        fs.renameSync(this.file, path.join(dir, 'clipwright.previous.log'))
+      if (dir !== this.dir) {
+        this.dir = dir
+        this.file = path.join(dir, 'clipwright.log')
+        this.writes = 0
       }
-      this.stream = fs.createWriteStream(this.file, { flags: 'a' })
+      this.writes += 1
+      if (this.writes % ROTATE_CHECK_EVERY === 1 && fs.existsSync(this.file)) {
+        if (fs.statSync(this.file).size > MAX_BYTES) {
+          fs.renameSync(this.file, path.join(dir, 'clipwright.previous.log'))
+        }
+      }
+      return this.file
     } catch {
-      /* logging must never crash the app */
+      return null
     }
   }
 
   private write(level: Level, scope: string, message: string, extra?: unknown): void {
-    this.ensure()
     const stamp = new Date().toISOString()
     let line = `${stamp} [${level.toUpperCase()}] ${scope}: ${message}`
     if (extra !== undefined) {
@@ -38,7 +55,14 @@ class Logger {
     // eslint-disable-next-line no-console
     if (level === 'error') console.error(line)
     else console.log(line)
-    this.stream?.write(`${line}\n`)
+    try {
+      const file = this.target()
+      // Logging must never crash the app, and must never break an operation that
+      // happened to log something.
+      if (file) fs.appendFileSync(file, `${line}\n`)
+    } catch {
+      /* ignore */
+    }
   }
 
   info(scope: string, message: string, extra?: unknown): void {
@@ -54,8 +78,22 @@ class Logger {
     if (process.env.CLIPWRIGHT_DEBUG) this.write('debug', scope, message, extra)
   }
   logPath(): string {
-    return this.file
+    return this.file || path.join(this.dir || '', 'clipwright.log')
   }
 }
 
-export const log = new Logger()
+let instance: Logger | null = null
+
+export function logger(): Logger {
+  if (!instance) instance = new Logger()
+  return instance
+}
+
+/** Convenience facade used across the main process. */
+export const log = {
+  info: (scope: string, message: string, extra?: unknown) => logger().info(scope, message, extra),
+  warn: (scope: string, message: string, extra?: unknown) => logger().warn(scope, message, extra),
+  error: (scope: string, message: string, extra?: unknown) => logger().error(scope, message, extra),
+  debug: (scope: string, message: string, extra?: unknown) => logger().debug(scope, message, extra),
+  path: () => logger().logPath()
+}

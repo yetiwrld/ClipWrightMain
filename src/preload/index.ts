@@ -41,6 +41,7 @@ export interface ClipwrightApi {
     openPath(target: string): Promise<{ ok: boolean; error?: string }>
     revealPath(target: string): Promise<{ ok: boolean }>
     setZoom(factor: number): Promise<void>
+    quit(): Promise<void>
   }
   settings: {
     get(): Promise<Settings>
@@ -158,7 +159,8 @@ const api: ClipwrightApi = {
     readLogs: (lines) => invoke<{ text: string; file: string; bytes: number }>(IPC.app.readLogs, lines),
     openPath: (target) => invoke(IPC.app.openPath, target),
     revealPath: (target) => invoke(IPC.app.revealPath, target),
-    setZoom: (factor) => invoke(IPC.app.setZoom, factor)
+    setZoom: (factor) => invoke(IPC.app.setZoom, factor),
+    quit: () => invoke(IPC.app.quit)
   },
   settings: {
     get: () => invoke<Settings>(IPC.settings.get),
