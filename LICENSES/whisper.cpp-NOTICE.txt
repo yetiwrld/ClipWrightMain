@@ -1,0 +1,15 @@
+whisper.cpp — bundled runtime (optional)
+=======================================
+
+When the build script succeeds in fetching it, Clipwright Studio ships
+whisper-cli.exe (plus its runtime DLLs) to enable fully offline transcription.
+
+Source:  https://github.com/ggml-org/whisper.cpp
+Licence: MIT (Copyright © 2023-2024 The ggml authors)
+
+Speech models (ggml-*.bin) are NOT bundled — the user downloads them from
+Hugging Face on demand through Settings → Local models, under the licence of the
+respective model (OpenAI Whisper weights, MIT).
+
+If the binary is absent, the application reports offline transcription as
+unavailable rather than implying it works.

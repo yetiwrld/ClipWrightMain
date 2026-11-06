@@ -1,0 +1,25 @@
+node_modules/
+out/
+release/
+dist/
+*.log
+.DS_Store
+.env
+.env.*
+# never commit user media, exports or build output
+Exports/
+Projects/
+Models/*.gguf
+Models/*.bin
+test-results/
+coverage/
+
+# downloaded Windows binaries (fetched in CI by scripts/fetch-binaries.mjs)
+.downloads/
+resources/ffmpeg/*.exe
+resources/bin/*.exe
+resources/bin/*.dll
+resources/binaries.json
+.smoke-res/
+.smoke-bundle.mjs
+.smoke-entry.ts
