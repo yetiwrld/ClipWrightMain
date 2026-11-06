@@ -1,0 +1,15 @@
+node_modules/
+out/
+release/
+dist/
+*.log
+.DS_Store
+.env
+.env.*
+# never commit user media, exports or build output
+Exports/
+Projects/
+Models/*.gguf
+Models/*.bin
+test-results/
+coverage/

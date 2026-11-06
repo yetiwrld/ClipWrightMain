@@ -1,0 +1,222 @@
+/* Base reset, typography and shared primitives. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+  user-select: none;
+  font-feature-settings: 'cv05' 1, 'ss01' 1, 'tnum' 0;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5 {
+  margin: 0;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: var(--lh-tight);
+}
+
+p {
+  margin: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+button {
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  box-shadow: var(--focus-ring);
+  border-radius: var(--r-sm);
+}
+
+a {
+  color: var(--brand);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+::selection {
+  background: var(--brand-soft-strong);
+  color: var(--text);
+}
+
+/* Scrollbars: quiet, thin, consistent. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--r-pill);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ---------- layout helpers ---------- */
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.grow {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.stack-sm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.stack-md {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.stack-lg {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.secondary {
+  color: var(--text-secondary);
+}
+
+.label {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.hint {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  line-height: var(--lh-relaxed);
+}
+
+.divider {
+  height: 1px;
+  background: var(--separator);
+  border: 0;
+  margin: 0;
+}
+
+.divider-v {
+  width: 1px;
+  align-self: stretch;
+  background: var(--separator);
+  margin: 0 var(--sp-1);
+}
+
+.scroll-y {
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.no-select {
+  user-select: none;
+}
+
+.selectable {
+  user-select: text;
+}
