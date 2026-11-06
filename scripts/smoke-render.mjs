@@ -132,13 +132,23 @@ await build({
   platform: 'node',
   format: 'esm',
   outfile: bundle,
-  external: ['electron'],
-  alias: { '@shared': path.join(root, 'src/shared') },
+  // Outside a running Electron app there is no `electron` module; the stub
+  // provides the read-only pieces the compositor touches.
+  alias: {
+    '@shared': path.join(root, 'src/shared'),
+    electron: path.join(root, 'tests/stubs/electron-main.ts')
+  },
   logLevel: 'error'
 })
 fs.rmSync(entry, { force: true })
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'clipwright-smoke-'))
+
+// Main-process modules resolve binaries/fonts through the packaged resources
+// directory and store the workspace under the app-data path; point both at the
+// temp area so the smoke run never touches a real user profile.
+process.env.CLIPWRIGHT_RESOURCES = resources
+process.env.CLIPWRIGHT_APP_DATA = path.join(temp, 'appdata')
 const { run } = await import(pathToFileURL(bundle).href)
 const { result } = await run({ ffmpeg: ffmpegExe, fonts: fontsDir, source, out: outFile, temp })
 fs.rmSync(bundle, { force: true })
@@ -146,21 +156,60 @@ fs.rmSync(bundle, { force: true })
 if (!result.ok) fail(`render failed: ${result.error ?? 'unknown error'} (log: ${result.logPath})`)
 for (const warning of result.warnings ?? []) ok(`warning: ${warning}`)
 
+/* ---------------------------- verify the output ---------------------------- */
+
+function probeWithFfprobe(file) {
+  const json = execFileSync(
+    ffprobeExe,
+    ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file],
+    { encoding: 'utf8' }
+  )
+  const parsed = JSON.parse(json)
+  return {
+    video: parsed.streams.find((stream) => stream.codec_type === 'video'),
+    audio: parsed.streams.find((stream) => stream.codec_type === 'audio'),
+    duration: Number(parsed.format?.duration ?? 0)
+  }
+}
+
+/** Fallback: read the same facts out of ffmpeg's input banner. */
+function probeWithFfmpeg(file) {
+  let banner = ''
+  try {
+    banner = execFileSync(ffmpegExe, ['-hide_banner', '-i', file], { encoding: 'utf8', stdio: 'pipe' })
+  } catch (error) {
+    banner = `${error.stderr ?? ''}${error.stdout ?? ''}`
+  }
+  const videoLine = /Stream #\S+.*?: Video: (\w+).*?, (\w+)(?:\(\w+\))?, (\d+)x(\d+)/.exec(banner)
+  const audioLine = /Stream #\S+.*?: Audio: (\w+)/.exec(banner)
+  const durationMatch = /Duration: (\d+):(\d+):(\d+\.\d+)/.exec(banner)
+  const duration = durationMatch
+    ? Number(durationMatch[1]) * 3600 + Number(durationMatch[2]) * 60 + Number(durationMatch[3])
+    : 0
+  return {
+    video: videoLine
+      ? { codec_name: videoLine[1], pix_fmt: videoLine[2], width: videoLine[3], height: videoLine[4] }
+      : undefined,
+    audio: audioLine ? { codec_name: audioLine[1] } : undefined,
+    duration
+  }
+}
+
 /* ------------------------------- verify output ------------------------------- */
 
 mustExist(outFile, 'exported video')
 const size = fs.statSync(outFile).size
 if (size < 50_000) fail(`exported video is only ${size} bytes — the encoder produced nothing usable`)
 
-const probed = JSON.parse(
-  execFileSync(
-    ffprobeExe,
-    ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', outFile],
-    { encoding: 'utf8' }
-  )
-)
-const video = probed.streams.find((s) => s.codec_type === 'video')
-const audio = probed.streams.find((s) => s.codec_type === 'audio')
+let probed
+try {
+  probed = probeWithFfprobe(outFile)
+} catch (error) {
+  ok(`ffprobe could not verify this file (${String(error.message).split('\n')[0]}); reading the ffmpeg banner instead`)
+  probed = probeWithFfmpeg(outFile)
+}
+
+const { video, audio } = probed
 if (!video) fail('no video stream in the export')
 if (!audio) fail('no audio stream in the export')
 if (video.codec_name !== 'h264') fail(`expected h264, got ${video.codec_name}`)
@@ -168,8 +217,7 @@ if (video.pix_fmt !== 'yuv420p') fail(`expected yuv420p (player compatibility), 
 if (Number(video.width) !== 1920 || Number(video.height) !== 1080) {
   fail(`expected 1920x1080, got ${video.width}x${video.height}`)
 }
-const duration = Number(probed.format.duration ?? 0)
-if (!(duration > 1.5 && duration < 3.5)) fail(`expected ~2s of video, got ${duration}s`)
+if (!(probed.duration > 1.5 && probed.duration < 3.5)) fail(`expected ~2s of video, got ${probed.duration}s`)
 
-ok(`export: ${path.basename(outFile)} ${(size / 1024).toFixed(0)} KB, ${video.width}x${video.height} ${video.codec_name}/${video.pix_fmt}, audio ${audio.codec_name}, ${duration.toFixed(2)}s`)
+ok(`export: ${path.basename(outFile)} ${(size / 1024).toFixed(0)} KB, ${video.width}x${video.height} ${video.codec_name}/${video.pix_fmt}, audio ${audio.codec_name}, ${probed.duration.toFixed(2)}s`)
 ok('PASS — the packaged app can import, composite, burn captions and encode')

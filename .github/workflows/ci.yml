@@ -46,8 +46,19 @@ jobs:
       - name: Build (catches import/bundling mistakes that types miss)
         run: npm run build
 
+      - name: Assemble a resources folder from the installed ffmpeg
+        shell: pwsh
+        run: |
+          # Mirrors the layout the installer produces (resources/ffmpeg/*.exe,
+          # resources/fonts/*.ttf) so the smoke render runs the same code path.
+          New-Item -ItemType Directory -Force .smoke-res/ffmpeg, .smoke-res/fonts | Out-Null
+          Copy-Item (Get-Command ffmpeg).Source .smoke-res/ffmpeg/ffmpeg.exe
+          Copy-Item (Get-Command ffprobe).Source .smoke-res/ffmpeg/ffprobe.exe
+          Copy-Item resources/fonts/*.ttf .smoke-res/fonts/
+          Get-ChildItem .smoke-res -Recurse -File | Select-Object Name, Length
+
       - name: Export a real video from the build
-        run: node scripts/smoke-render.mjs --resources . --out ${{ runner.temp }}/clipwright-smoke.mp4
+        run: node scripts/smoke-render.mjs --resources .smoke-res --out ${{ runner.temp }}/clipwright-smoke.mp4
 
   # Runs when a commit asks for it (`[package]` in the message) or by hand.
   # Once this branch is merged, `release.yml` becomes the canonical build

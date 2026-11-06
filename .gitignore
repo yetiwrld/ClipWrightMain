@@ -20,3 +20,6 @@ resources/ffmpeg/*.exe
 resources/bin/*.exe
 resources/bin/*.dll
 resources/binaries.json
+.smoke-res/
+.smoke-bundle.mjs
+.smoke-entry.ts
