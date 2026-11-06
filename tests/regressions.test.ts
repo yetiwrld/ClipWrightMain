@@ -175,3 +175,21 @@ describe('playhead scrubbing', () => {
     expect(useEditor.getState().scrubHeadMs).toBeNull()
   })
 })
+
+describe('in-app update asset selection', () => {
+  it('offers the installer, never the portable build', async () => {
+    const { pickInstallerAsset } = await import('../src/main/updater')
+    const assets = [
+      { name: 'Clipwright-Studio-Portable-1.0.1-x64.exe', browser_download_url: 'u1', size: 1 },
+      { name: 'Clipwright-Studio-Setup-1.0.1-x64.exe', browser_download_url: 'u2', size: 2 },
+      { name: 'checksums.txt', browser_download_url: 'u3', size: 3 }
+    ]
+    expect(pickInstallerAsset(assets)?.browser_download_url).toBe('u2')
+  })
+
+  it('still finds something when only a portable build was published', async () => {
+    const { pickInstallerAsset } = await import('../src/main/updater')
+    const assets = [{ name: 'Clipwright-Studio-Portable-1.0.1-x64.exe', browser_download_url: 'u1', size: 1 }]
+    expect(pickInstallerAsset(assets)?.browser_download_url).toBe('u1')
+  })
+})

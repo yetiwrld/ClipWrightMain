@@ -229,8 +229,41 @@ jobs:
             release/checksums.txt
           if-no-files-found: error
 
+      # A commit message may ask for a *stable* release with `[release]` instead of
+      # a pre-release. Only do that deliberately: the stable channel is what every
+      # installed copy of the app checks, so an accidental tag would be pushed to
+      # real users as an update.
+      - name: Publish a stable release
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[release]')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tag = "v$version"
+          $existing = gh release view $tag --json tagName -q .tagName 2>$null
+          if ($existing) { throw "release $tag already exists — bump package.json first" }
+          $notes = @"
+          Clipwright Studio $version (Windows x64).
+
+          Assets:
+          - ``Clipwright-Studio-Setup-$version-x64.exe`` — per-user installer (no admin prompt)
+          - ``Clipwright-Studio-Portable-$version-x64.exe`` — single file, no install
+          - ``checksums.txt`` — SHA-256 for each file
+
+          Installed copies of Clipwright find this automatically (Settings → Updates, or the
+          banner on the workspace screen) and verify it against checksums.txt before running it.
+
+          This build is unsigned, so Windows SmartScreen will warn on first run: choose
+          "More info" → "Run anyway", and compare the hash against checksums.txt first.
+          "@
+          $notes | Set-Content release/notes.md
+          $assets = @(Get-ChildItem release -File | Where-Object { $_.Name -match 'Setup|Portable|checksums\.txt|\.blockmap$|latest\.yml' } | ForEach-Object { $_.FullName })
+          gh release create $tag --target $env:GITHUB_SHA --title "Clipwright Studio $version" --notes-file release/notes.md --latest @assets
+          Write-Host "released $tag"
+
       - name: Publish a downloadable build
-        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[package]')
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[package]') && !contains(github.event.head_commit.message, '[release]')
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -243,8 +276,8 @@ jobs:
           Automated Windows x64 build of commit $($env:GITHUB_SHA).
 
           Assets:
-          - ``Clipwright-Studio-Setup-1.0.0-x64.exe`` — per-user installer (no admin prompt)
-          - ``Clipwright-Studio-Portable-1.0.0-x64.exe`` — single file, no install
+          - ``Clipwright-Studio-Setup-$((Get-Content package.json -Raw | ConvertFrom-Json).version)-x64.exe`` — per-user installer (no admin prompt)
+          - ``Clipwright-Studio-Portable-$((Get-Content package.json -Raw | ConvertFrom-Json).version)-x64.exe`` — single file, no install
           - ``checksums.txt`` — SHA-256 for each file
 
           This build is unsigned, so Windows SmartScreen will warn on first run: choose

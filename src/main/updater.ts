@@ -67,6 +67,20 @@ async function fetchReleases(): Promise<GithubRelease[]> {
   return (await response.json()) as GithubRelease[]
 }
 
+/**
+ * Choose the asset an installed copy should download.
+ *
+ * Exported for tests and for the Update screen: the portable build must never be
+ * picked, because launching it would not upgrade the installed copy.
+ */
+export function pickInstallerAsset<T extends { name: string }>(assets: T[]): T | undefined {
+  return (
+    assets.find((a) => /\.exe$/i.test(a.name) && /setup/i.test(a.name)) ??
+    assets.find((a) => /\.exe$/i.test(a.name) && !/portable/i.test(a.name)) ??
+    assets.find((a) => /\.exe$/i.test(a.name))
+  )
+}
+
 export async function checkForUpdates(manual = false): Promise<UpdateInfo> {
   const channel = settingsStore().get().updates.channel
   const current = currentVersion()
@@ -83,9 +97,13 @@ export async function checkForUpdates(manual = false): Promise<UpdateInfo> {
     }
     const sorted = usable.sort((a, b) => compareVersions(b.tag_name, a.tag_name))
     const latest = sorted[0]
-    const installer =
-      latest.assets.find((a) => /\.exe$/i.test(a.name) && /setup|x64/i.test(a.name)) ??
-      latest.assets.find((a) => /\.exe$/i.test(a.name))
+    /*
+     * Prefer the installer, never the portable single-file build: running the
+     * portable executable would not upgrade the installed copy, it would just
+     * launch a second one. Fall back to any other asset only if no Setup file
+     * exists at all, so the user is never offered nothing.
+     */
+    const installer = pickInstallerAsset(latest.assets)
     const checksumAsset = latest.assets.find((a) => /\.sha256$|checksums\.json$/i.test(a.name))
     const available = compareVersions(latest.tag_name, current) > 0
     const info: UpdateInfo = {
