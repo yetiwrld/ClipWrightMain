@@ -52,11 +52,24 @@ jobs:
         run: |
           # Mirrors the layout the installer produces (resources/ffmpeg/*.exe,
           # resources/fonts/*.ttf) so the smoke render runs the same code path.
+          # Note: `Get-Command ffmpeg` returns Chocolatey's *shim*, which only
+          # works from its original location — copy the real binary instead.
           New-Item -ItemType Directory -Force .smoke-res/ffmpeg, .smoke-res/fonts | Out-Null
-          Copy-Item (Get-Command ffmpeg).Source .smoke-res/ffmpeg/ffmpeg.exe
-          Copy-Item (Get-Command ffprobe).Source .smoke-res/ffmpeg/ffprobe.exe
+          function Find-RealBinary([string]$name) {
+            $direct = @("$env:ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin\$name.exe")
+            foreach ($candidate in $direct) {
+              if (Test-Path $candidate -PathType Leaf) { return (Get-Item $candidate).FullName }
+            }
+            $found = Get-ChildItem "$env:ProgramData\chocolatey\lib" -Recurse -Filter "$name.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.Length -gt 5MB } | Select-Object -First 1
+            if ($found) { return $found.FullName }
+            throw "could not locate a real $name.exe on this runner"
+          }
+          Copy-Item (Find-RealBinary 'ffmpeg') .smoke-res/ffmpeg/ffmpeg.exe
+          Copy-Item (Find-RealBinary 'ffprobe') .smoke-res/ffmpeg/ffprobe.exe
           Copy-Item resources/fonts/*.ttf .smoke-res/fonts/
-          Get-ChildItem .smoke-res -Recurse -File | Select-Object Name, Length
+          Get-ChildItem .smoke-res -Recurse -File | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}}
+          & .smoke-res/ffmpeg/ffmpeg.exe -hide_banner -version | Select-Object -First 1
 
       - name: Export a real video from the build
         id: smoke
