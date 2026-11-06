@@ -1,6 +1,7 @@
 name: CI
 
-# Fast feedback on every branch: types and tests only, no packaging.
+# Fast feedback on every branch: types, tests, build, and a real export with the
+# freshly built output. No packaging here — that is `release.yml`.
 on:
   push:
     branches-ignore:
@@ -39,3 +40,6 @@ jobs:
 
       - name: Build (catches import/bundling mistakes that types miss)
         run: npm run build
+
+      - name: Export a real video from the build
+        run: node scripts/smoke-render.mjs --resources . --out ${{ runner.temp }}/clipwright-smoke.mp4
