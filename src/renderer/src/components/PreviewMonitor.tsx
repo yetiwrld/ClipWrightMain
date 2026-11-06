@@ -20,6 +20,7 @@ import { useEditor } from '../state/editor'
 import { IconButton } from './ui'
 import { formatTimecode } from '@shared/time'
 import { drawScene, layerBounds } from '../lib/preview-canvas'
+import { buildScene } from '@shared/scene'
 import { useVideoPool } from '../hooks/useVideoPool'
 import type { SceneLayer } from '@shared/scene'
 
@@ -53,6 +54,7 @@ export function PreviewMonitor(): JSX.Element {
   const [fit, setFit] = useState<'fit' | 'actual'>('fit')
   const dragRef = useRef<DragMode | null>(null)
   const movedRef = useRef(false)
+  const justDraggedRef = useRef(false)
 
   const requestDraw = useCallback(() => setFrame((f) => f + 1), [])
   const pool = useVideoPool(project, playhead, playing, requestDraw)
@@ -176,28 +178,34 @@ export function PreviewMonitor(): JSX.Element {
   const endDrag = () => {
     const wasDragging = dragRef.current !== null
     dragRef.current = null
+    justDraggedRef.current = wasDragging && movedRef.current
     if (wasDragging && movedRef.current && selectedClip) finishTransformDrag(selectedClip.id)
   }
 
   /** Click on the canvas selects the topmost layer under the pointer. */
   const onCanvasClick = (event: React.MouseEvent) => {
     if (!project || dragRef.current || movedRef.current) return
-    const point = normalised(event.clientX, event.clientY)
-    const layers: SceneLayer[] = [...(drawScene as unknown as { lastScene?: SceneLayer[] })?.lastScene ?? []]
-    void layers
-    // Hit-test against the selected clip first so accidental canvas clicks keep it.
-    if (selectedClip) {
-      const bounds = layerBoundsAt(selectedClip.id)
-      if (bounds) return
+    // A click that dragged a handle is a transform edit, not a selection change.
+    if (justDraggedRef.current) {
+      justDraggedRef.current = false
+      return
     }
-    selectClips([])
-  }
-
-  const layerBoundsAt = (clipId: string) => {
-    if (!project) return null
-    const clip = project.clips.find((c) => c.id === clipId)
-    if (!clip) return null
-    return clip
+    const point = normalised(event.clientX, event.clientY)
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const scene = buildScene(project, playhead)
+    const hit = [...scene.layers]
+      .reverse()
+      .find((layer) => {
+        if (layer.hidden || layer.opacity < 0.05) return false
+        const rect = layerBounds(layer, canvas.width, canvas.height)
+        const x = rect.x / canvas.width
+        const y = rect.y / canvas.height
+        const w = rect.w / canvas.width
+        const h = rect.h / canvas.height
+        return point.x >= x && point.x <= x + w && point.y >= y && point.y <= y + h
+      })
+    selectClips(hit ? [hit.id] : [])
   }
 
   const bounds = useMemo(() => {

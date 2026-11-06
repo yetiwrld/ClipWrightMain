@@ -18,6 +18,7 @@ import { registerHandlers } from './handlers'
 import { log } from './logger'
 import { menuTemplate } from './menu'
 import { killAll } from './ffmpeg/runner'
+import { handlePackageArguments, type OpenedPackage } from './open-package'
 
 // Single instance: focus the existing window instead of starting a second copy.
 const gotLock = app.requestSingleInstanceLock()
@@ -26,6 +27,15 @@ if (!gotLock) {
 }
 
 let mainWindow: BrowserWindow | null = null
+
+/**
+ * A package passed on the command line (file association) is imported before the
+ * renderer asks for it; the renderer drains it at boot via `project.pendingOpen`.
+ * A package opened while the app is already running is pushed as an event.
+ */
+function forwardPackage(payload: OpenedPackage): void {
+  mainWindow?.webContents.send(IPC.events.openPackage, payload)
+}
 
 // Serve local media to the renderer through a controlled protocol so file paths
 // with spaces/unicode work and the renderer never needs node integration.
@@ -123,12 +133,18 @@ app.whenReady().then(async () => {
   const menu = Menu.buildFromTemplate(menuTemplate(() => mainWindow))
   Menu.setApplicationMenu(menu)
 
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, argv) => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore()
       mainWindow.focus()
     }
+    // "Open with Clipwright Studio" from Explorer while the app is running.
+    void handlePackageArguments(argv, forwardPackage)
   })
+
+  // Cold start via file association: import now; the renderer drains the result
+  // when it finishes booting (see IPC.project.pendingOpen).
+  void handlePackageArguments(process.argv, forwardPackage)
 
   // Automatic update check (silent: only reports when an update is available).
   const settings = settingsStore().get()

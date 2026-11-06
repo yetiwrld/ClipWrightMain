@@ -33,9 +33,11 @@ import {
   writeJsonAtomic,
   safeJsonRead,
   importsRoot,
-  isOnline
+  isOnline,
+  readLogTail
 } from './handlers-support'
 import * as projects from './projects'
+import { waitForPendingPackage } from './open-package'
 import { importLocalFile, generateThumbnail, genWaveform } from './media/importer'
 import { inspectRemote, downloadRemote } from './media/remote'
 import { providerStore, PROVIDER_TEMPLATES, testProvider, listModels } from './ai/providers'
@@ -97,6 +99,7 @@ export function registerHandlers(windowGetter: () => BrowserWindow | null): void
   ipcMain.handle(IPC.app.openLogs, async () => {
     await shell.openPath(workspaceLayout().logs)
   })
+  ipcMain.handle(IPC.app.readLogs, (_e, lines?: number) => readLogTail(lines ?? 400))
   ipcMain.handle(IPC.app.openPath, async (_e, target: string) => {
     const error = await shell.openPath(target)
     return { ok: !error, error: error || undefined }
@@ -195,6 +198,14 @@ export function registerHandlers(windowGetter: () => BrowserWindow | null): void
   ipcMain.handle(IPC.project.exportPackage, async (_e, id: string, includeMedia: boolean) =>
     projects.exportPackage(id, includeMedia)
   )
+  ipcMain.handle(IPC.project.pendingOpen, () => waitForPendingPackage())
+  ipcMain.handle(IPC.project.importPackagePath, async (_e, filePath: string) => {
+    // Used by the .clipwright file association and "Open package…" — validates
+    // the path before handing it to the importer.
+    if (!fs.existsSync(filePath)) throw new Error('That file could not be found.')
+    const project = await projects.importPackage(filePath)
+    return project
+  })
   ipcMain.handle(IPC.project.importPackage, async (_e, dir?: string) => {
     let target = dir
     if (!target) {

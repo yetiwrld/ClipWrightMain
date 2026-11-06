@@ -15,10 +15,13 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { workspaceLayout } from './workspace'
 import { safeFilename, uniquePath } from './paths'
-import { SCHEMA_VERSION } from '@shared/defaults'
+import { SCHEMA_VERSION, createProject } from '@shared/defaults'
 import { baseClip } from '@shared/timeline'
 import type { Project, ProjectMeta } from '@shared/types'
 import { log } from './logger'
+import { zipSync, unzipSync } from 'fflate'
+
+const strToBytes = (value: string): Uint8Array => new Uint8Array(Buffer.from(value, 'utf8'))
 
 const MAX_RECOVERY_SNAPSHOTS = 20
 
@@ -210,7 +213,6 @@ export function restoreRecovery(id: string): Project {
 /* ------------------------------------------------------------------ */
 
 export function create(name: string, aspect: string, fps: number, templateId?: string): Project {
-  const { createProject } = require('@shared/defaults') as typeof import('@shared/defaults')
   const project = createProject(name || 'Untitled project', aspect, fps)
   if (templateId === 'vertical-clip') {
     project.canvas.aspect = '9:16'
@@ -283,41 +285,61 @@ export function archive(id: string): string {
 }
 
 /**
- * Export a portable project package: the project document plus managed media and
- * the transcript/moments. Implemented as a directory package inside a single
- * .clipwright container (a zip-less, inspectable folder) plus a manifest so it can
- * be re-imported on another computer.
+ * Export a portable project package as a single `.clipwright` file.
+ *
+ * The file is an ordinary ZIP (so it can be inspected with any unzip tool) whose
+ * root contains `project.json`, optional `transcript.json` / `moments.json` and,
+ * when `includeMedia` is set, the managed media under `media/`.
+ *
+ *   project.json  { kind: 'clipwright-package', version, project, ... }
+ *
+ * Asset paths inside the manifest are relative (`media/<file>`), so the package
+ * survives being moved between machines.
  */
 export async function exportPackage(id: string, includeMedia = true): Promise<string> {
   const project = loadProject(id)
   const dir = workspaceLayout().exports
   fs.mkdirSync(dir, { recursive: true })
   const target = uniquePath(dir, `${safeFilename(project.name)}.clipwright`)
-  fs.mkdirSync(target, { recursive: true })
-  const packaged: Project = { ...project, assets: project.assets.map((a) => ({ ...a })) }
+
+  const packaged: Project = {
+    ...project,
+    assets: project.assets.map((asset) => {
+      if (asset.storage !== 'managed') return { ...asset }
+      // Rewrite to a package-relative path so the manifest is machine-independent.
+      const relative = path.join('media', path.basename(asset.path)).replace(/\\/g, '/')
+      return { ...asset, path: relative, relativePath: relative }
+    })
+  }
+
+  const entries: Record<string, Uint8Array> = {}
   let totalBytes = 0
+  const mediaFiles: string[] = []
+
   if (includeMedia) {
-    const mediaDir = path.join(target, 'media')
-    fs.mkdirSync(mediaDir, { recursive: true })
-    for (const asset of packaged.assets) {
-      if (!fs.existsSync(asset.path)) continue
+    for (const asset of project.assets) {
       if (asset.storage !== 'managed') continue
-      const dest = path.join(mediaDir, path.basename(asset.path))
-      await fsp.copyFile(asset.path, dest)
-      totalBytes += fs.statSync(dest).size
-      asset.path = path.join('media', path.basename(asset.path))
-      asset.relativePath = asset.path
+      if (!fs.existsSync(asset.path)) continue
+      const name = path.basename(asset.path)
+      const bytes = await fsp.readFile(asset.path)
+      // Media is already compressed; store it rather than inflating the package
+      // size (and the time) for no gain.
+      entries[`media/${name}`] = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+      mediaFiles.push(`media/${name}`)
+      totalBytes += bytes.byteLength
     }
   }
-  fs.writeFileSync(
-    path.join(target, 'project.json'),
+
+  entries['project.json'] = strToBytes(
     JSON.stringify(
       {
         kind: 'clipwright-package',
         version: 1,
+        app: 'Clipwright Studio',
         exportedAt: Date.now(),
         includeMedia,
         totalBytes,
+        mediaFiles,
         project: packaged
       },
       null,
@@ -326,44 +348,105 @@ export async function exportPackage(id: string, includeMedia = true): Promise<st
   )
   for (const extra of ['transcript.json', 'moments.json']) {
     const source = path.join(projectDir(id), extra)
-    if (fs.existsSync(source)) fs.copyFileSync(source, path.join(target, extra))
+    if (fs.existsSync(source)) entries[extra] = new Uint8Array(await fsp.readFile(source))
   }
+
+  const archive = zipSync(entries, { level: 0 })
+  await fsp.writeFile(target, archive)
+  log.info('projects', `exported package ${path.basename(target)} (${(archive.byteLength / 1_048_576).toFixed(1)} MB, media=${includeMedia})`)
   return target
 }
 
-export async function importPackage(packageDir: string): Promise<Project> {
-  const manifestFile = path.join(packageDir, 'project.json')
-  if (!fs.existsSync(manifestFile)) throw new Error('This folder is not a Clipwright project package (project.json is missing).')
-  const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8')) as {
+/**
+ * Import a package previously produced by {@link exportPackage}.
+ *
+ * Accepts either the `.clipwright` archive or a legacy folder package. The
+ * project always gets a fresh id, so importing the same package twice creates two
+ * projects instead of overwriting one.
+ */
+export async function importPackage(packagePath: string): Promise<Project> {
+  if (!fs.existsSync(packagePath)) throw new Error('That file could not be found.')
+
+  let manifestFile = path.join(packagePath, 'project.json')
+  let extractDir: string | null = null
+  let manifestBytes: Uint8Array | null = null
+  let archive: Record<string, Uint8Array> | null = null
+
+  if (fs.statSync(packagePath).isFile()) {
+    if (!packagePath.toLowerCase().endsWith('.clipwright')) {
+      throw new Error('That is not a Clipwright package — expected a .clipwright file.')
+    }
+    try {
+      archive = unzipSync(new Uint8Array(await fsp.readFile(packagePath)))
+    } catch {
+      throw new Error('That .clipwright file is damaged or is not a Clipwright package.')
+    }
+    const manifest = Object.keys(archive).find((name) => name === 'project.json' || name.endsWith('/project.json'))
+    if (!manifest) throw new Error('That package has no project.json — it may be corrupt.')
+    manifestBytes = archive[manifest]
+    manifestFile = manifest
+  } else if (!fs.existsSync(manifestFile)) {
+    throw new Error('This folder is not a Clipwright project package (project.json is missing).')
+  }
+
+  const raw = manifestBytes ?? new Uint8Array(await fsp.readFile(manifestFile))
+  const manifest = JSON.parse(Buffer.from(raw).toString('utf8')) as {
     kind?: string
-    project: Project
+    project?: Project
+    mediaFiles?: string[]
   }
   if (manifest.kind !== 'clipwright-package' || !manifest.project) {
     throw new Error('That file is not a Clipwright project package.')
   }
+
   const project = manifest.project
   project.id = `prj_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`
   project.createdAt = Date.now()
+  project.updatedAt = Date.now()
   const targetDir = projectDir(project.id)
-  fs.mkdirSync(path.join(targetDir, 'media'), { recursive: true })
+  const mediaDir = path.join(targetDir, 'media')
+  fs.mkdirSync(mediaDir, { recursive: true })
+
+  let missingMedia = 0
   for (const asset of project.assets) {
-    if (!asset.path.startsWith('media')) continue
-    const source = path.join(packageDir, asset.path)
-    if (!fs.existsSync(source)) {
-      asset.missing = true
+    const inside = (asset.path ?? '').replace(/\\/g, '/')
+    if (!inside.startsWith('media/')) continue
+    const name = path.basename(inside)
+    const bytes = archive?.[inside] ?? archive?.[`media/${name}`]
+    if (bytes) {
+      const dest = path.join(mediaDir, name)
+      await fsp.writeFile(dest, bytes)
+      asset.path = dest
+      asset.relativePath = path.join('media', name)
       continue
     }
-    const dest = path.join(targetDir, 'media', path.basename(asset.path))
-    await fsp.copyFile(source, dest)
-    asset.path = dest
-    asset.relativePath = path.join('media', path.basename(dest))
-    asset.missing = false
+    const folderSource = path.join(packagePath, inside)
+    if (!archive && fs.existsSync(folderSource)) {
+      const dest = path.join(mediaDir, name)
+      await fsp.copyFile(folderSource, dest)
+      asset.path = dest
+      asset.relativePath = path.join('media', name)
+      continue
+    }
+    asset.missing = true
+    missingMedia += 1
   }
+
+  if (missingMedia > 0) {
+    log.warn('projects', `package imported with ${missingMedia} missing media file(s)`)
+  }
+
   for (const extra of ['transcript.json', 'moments.json']) {
-    const source = path.join(packageDir, extra)
-    if (fs.existsSync(source)) fs.copyFileSync(source, path.join(targetDir, extra))
+    const bytes = archive?.[extra]
+    const source = path.join(packagePath, extra)
+    if (bytes) await fsp.writeFile(path.join(targetDir, extra), bytes)
+    else if (fs.existsSync(source) && fs.statSync(source).isFile()) {
+      await fsp.copyFile(source, path.join(targetDir, extra))
+    }
   }
-  saveProjectSync(project)
+
+  await saveProject(project)
+  log.info('projects', `imported package ${project.name} → ${project.id}`)
   return project
 }
 

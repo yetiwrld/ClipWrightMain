@@ -133,3 +133,29 @@ function app_resources_dir(): string {
 }
 
 export { ffmpegPath, installedModels, vault }
+
+/**
+ * Read the tail of the active log file for the Settings → Logs viewer.
+ *
+ * Reads a bounded slice from the end instead of loading the whole file, so a
+ * multi-megabyte log cannot stall the UI thread or blow up IPC.
+ */
+export function readLogTail(lines = 400): { text: string; file: string; bytes: number } {
+  const dir = workspaceLayout().logs
+  const file = path.join(dir, 'clipwright.log')
+  if (!fs.existsSync(file)) return { text: '', file, bytes: 0 }
+  const size = fs.statSync(file).size
+  const chunk = Math.min(size, 512 * 1024)
+  const handle = fs.openSync(file, 'r')
+  const buffer = Buffer.alloc(chunk)
+  try {
+    fs.readSync(handle, buffer, 0, chunk, size - chunk)
+  } finally {
+    fs.closeSync(handle)
+  }
+  const text = buffer.toString('utf8')
+  const split = text.split('\n')
+  // The first line of a mid-file slice is usually partial; drop it.
+  if (chunk < size) split.shift()
+  return { text: split.slice(-lines).join('\n'), file, bytes: size }
+}

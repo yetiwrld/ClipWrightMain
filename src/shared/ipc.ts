@@ -4,6 +4,7 @@ export const IPC = {
     info: 'app:info',
     capabilities: 'app:capabilities',
     openLogs: 'app:open-logs',
+    readLogs: 'app:read-logs',
     openPath: 'app:open-path',
     revealPath: 'app:reveal-path',
     quit: 'app:quit',
@@ -37,6 +38,8 @@ export const IPC = {
     archive: 'project:archive',
     exportPackage: 'project:export-package',
     importPackage: 'project:import-package',
+    importPackagePath: 'project:import-package-path',
+    pendingOpen: 'project:pending-open',
     missingAssets: 'project:missing-assets',
     relink: 'project:relink',
     recovery: 'project:recovery',
@@ -108,6 +111,7 @@ export const IPC = {
     updateProgress: 'event:update-progress',
     settingsChanged: 'event:settings-changed',
     menu: 'event:menu',
+    openPackage: 'event:open-package',
     modelProgress: 'event:model-progress'
   }
 } as const

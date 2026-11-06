@@ -13,3 +13,10 @@ Models/*.gguf
 Models/*.bin
 test-results/
 coverage/
+
+# downloaded Windows binaries (fetched in CI by scripts/fetch-binaries.mjs)
+.downloads/
+resources/ffmpeg/*.exe
+resources/bin/*.exe
+resources/bin/*.dll
+resources/binaries.json

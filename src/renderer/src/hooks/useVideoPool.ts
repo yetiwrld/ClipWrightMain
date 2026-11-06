@@ -87,6 +87,8 @@ export function createVideoPool(onReady?: () => void): VideoPool {
     const active = new Set<string>()
     for (const clip of project.clips) {
       if (!clip.assetId || clip.kind !== 'video') continue
+      // Inclusive on both edges: a clip that starts exactly at the playhead, or
+      // ends exactly at it, still needs its element alive.
       if (clip.start > timeMs || clip.start + clip.duration < timeMs) continue
       const asset = project.assets.find((a) => a.id === clip.assetId)
       if (!asset || asset.kind !== 'video') continue

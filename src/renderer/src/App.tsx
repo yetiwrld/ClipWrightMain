@@ -19,8 +19,7 @@ import {
   Type,
   Undo2,
   Wand2,
-  X,
-  Zap
+  X
 } from 'lucide-react'
 import { useEditor, useTimelineActions } from './state/editor'
 import { useApp } from './state/app'
@@ -41,7 +40,9 @@ import { Onboarding } from './screens/Onboarding'
 import { ImportWizard } from './screens/ImportWizard'
 import { api, errorMessage } from './lib/api'
 import { formatClock } from '@shared/time'
+import { baseClip, overwriteClip } from '@shared/timeline'
 import { DEFAULT_SHORTCUTS } from '@shared/presets'
+import brandMark from './assets/brand/icon-64.png'
 
 type Screen = 'home' | 'editor' | 'clips' | 'captions' | 'settings'
 type LibraryTab = 'media' | 'text' | 'audio'
@@ -120,6 +121,16 @@ export default function App(): JSX.Element {
             setUpdateBanner({ version: result.latestVersion, notes: result.notes ?? '' })
           }
         }
+        // A .clipwright file opened from Explorer (double-click) is imported by
+        // the main process before boot finishes; show it instead of the home screen.
+        const opened = await api.projects.pendingOpen().catch(() => null)
+        if (opened) {
+          await openProject(opened.projectId)
+          localStorage.setItem('clipwright.lastProject', opened.projectId)
+          setScreen('editor')
+          useEditor.getState().notify({ kind: 'success', title: 'Project package imported', body: opened.name })
+          return
+        }
         // Reopen the last project when the setting is on and one exists.
         if (current.settings?.general.restoreLastProject) {
           const lastId = localStorage.getItem('clipwright.lastProject')
@@ -161,6 +172,21 @@ export default function App(): JSX.Element {
       notify({ kind: 'error', title: 'Could not open project', body: errorMessage(error) })
     }
   }, [notify])
+
+  /* ----------------------- opened from Explorer ----------------------- */
+  useEffect(() => {
+    // "Open with Clipwright Studio" while the app is already running.
+    return api.events.onOpenPackage(async ({ projectId, name }) => {
+      try {
+        await openProject(projectId)
+        localStorage.setItem('clipwright.lastProject', projectId)
+        setScreen('editor')
+        useEditor.getState().notify({ kind: 'success', title: 'Project package imported', body: name })
+      } catch (error) {
+        useEditor.getState().notify({ kind: 'error', title: 'Could not open the package', body: errorMessage(error) })
+      }
+    })
+  }, [])
 
   /* --------------------------- native menu events --------------------------- */
   useEffect(() => {
@@ -224,6 +250,12 @@ export default function App(): JSX.Element {
         case 'ungroup':
           actions.ungroup()
           break
+        case 'fit-timeline': {
+          // Mirror of the timeline toolbar's "Fit project" button.
+          const duration = Math.max(1000, state.duration())
+          window.dispatchEvent(new CustomEvent('clipwright:fit-timeline', { detail: duration }))
+          break
+        }
         case 'zoom-in':
           state.setZoom(state.zoom * 1.3)
           break
@@ -298,9 +330,7 @@ export default function App(): JSX.Element {
   if (booting) {
     return (
       <div className="boot">
-        <div className="boot__mark">
-          <Zap size={22} />
-        </div>
+        <img className="boot__mark" src={brandMark} alt="" width={52} height={52} />
         <div className="boot__name">Clipwright Studio</div>
         <div className="boot__hint">
           <Loader2 size={13} className="spin" /> Preparing workspace…
@@ -525,9 +555,8 @@ function TopBar({
   return (
     <header className="topbar">
       <button className="topbar__brand" onClick={onHome} title="Projects">
-        <span className="topbar__logo">
-          <Zap size={13} />
-        </span>
+        {/* The supplied logo, scaled only — never redrawn. */}
+        <img className="topbar__logo" src={brandMark} alt="" width={20} height={20} draggable={false} />
         <span>Clipwright</span>
       </button>
 
@@ -665,23 +694,22 @@ function AudioLibrary(): JSX.Element {
                 variant="ghost"
                 onClick={() => {
                   if (!project) return
+                  // Place the asset on the first audio track at the playhead.
                   const track = project.tracks.find((t) => t.kind === 'audio')
                   if (!track) return
-                  apply(
-                    (p) => {
-                      const clip = {
-                        ...p.clips[0],
-                        id: undefined as unknown as string
-                      }
-                      void clip
-                      return p
-                    },
-                    'noop',
-                    { history: false }
-                  )
-                  void playhead
+                  const sourceDuration = asset.probe.durationMs ?? 30_000
+                  const clip = {
+                    ...baseClip('audio', track.id, asset.name),
+                    assetId: asset.id,
+                    start: playhead,
+                    sourceIn: 0,
+                    duration: Math.max(500, Math.min(sourceDuration, 60_000)),
+                    sourceDuration
+                  }
+                  apply((p) => overwriteClip(p, clip, playhead), 'Add audio clip')
+                  useEditor.getState().selectClips([clip.id])
                 }}
-                title="Add to the audio track (opens at the playhead)"
+                title="Add to the audio track at the playhead"
               >
                 <Plus size={12} />
               </Button>

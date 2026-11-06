@@ -37,6 +37,7 @@ export interface ClipwrightApi {
     info(): Promise<AppInfo>
     capabilities(force?: boolean): Promise<CapabilityReport>
     openLogs(): Promise<void>
+    readLogs(lines?: number): Promise<{ text: string; file: string; bytes: number }>
     openPath(target: string): Promise<{ ok: boolean; error?: string }>
     revealPath(target: string): Promise<{ ok: boolean }>
     setZoom(factor: number): Promise<void>
@@ -68,7 +69,9 @@ export interface ClipwrightApi {
     remove(id: string, deleteMedia: boolean): Promise<void>
     archive(id: string): Promise<string>
     exportPackage(id: string, includeMedia: boolean): Promise<string>
-    importPackage(dir?: string): Promise<Project | null>
+    importPackage(pathOrDir?: string): Promise<Project | null>
+    importPackagePath(filePath: string): Promise<Project>
+    pendingOpen(): Promise<{ projectId: string; name: string } | null>
     missingAssets(project: Project): Promise<{ id: string; name: string; path: string }[]>
     relink(projectId: string, assetId: string): Promise<Project | null>
     recovery(): Promise<unknown[]>
@@ -140,6 +143,7 @@ export interface ClipwrightApi {
     onUpdateProgress(handler: (payload: UpdateProgress & { info?: UpdateInfo }) => void): () => void
     onSettingsChanged(handler: (settings: Settings) => void): () => void
     onMenu(handler: (command: MenuCommand) => void): () => void
+    onOpenPackage(handler: (payload: { projectId: string; name: string }) => void): () => void
     onModelProgress(handler: (payload: ModelDownloadProgress) => void): () => void
   }
   /** Media files are served through a privileged protocol, not file:// */
@@ -151,6 +155,7 @@ const api: ClipwrightApi = {
     info: () => invoke<AppInfo>(IPC.app.info),
     capabilities: (force) => invoke<CapabilityReport>(IPC.app.capabilities, force),
     openLogs: () => invoke(IPC.app.openLogs),
+    readLogs: (lines) => invoke<{ text: string; file: string; bytes: number }>(IPC.app.readLogs, lines),
     openPath: (target) => invoke(IPC.app.openPath, target),
     revealPath: (target) => invoke(IPC.app.revealPath, target),
     setZoom: (factor) => invoke(IPC.app.setZoom, factor)
@@ -183,6 +188,8 @@ const api: ClipwrightApi = {
     archive: (id) => invoke<string>(IPC.project.archive, id),
     exportPackage: (id, includeMedia) => invoke<string>(IPC.project.exportPackage, id, includeMedia),
     importPackage: (dir) => invoke<Project | null>(IPC.project.importPackage, dir),
+    importPackagePath: (filePath) => invoke<Project>(IPC.project.importPackagePath, filePath),
+    pendingOpen: () => invoke<{ projectId: string; name: string } | null>(IPC.project.pendingOpen),
     missingAssets: (project) => invoke(IPC.project.missingAssets, project),
     relink: (projectId, assetId) => invoke<Project | null>(IPC.project.relink, projectId, assetId),
     recovery: () => invoke(IPC.project.recovery),
@@ -254,6 +261,7 @@ const api: ClipwrightApi = {
     onUpdateProgress: (handler) => subscribe(IPC.events.updateProgress, handler),
     onSettingsChanged: (handler) => subscribe(IPC.events.settingsChanged, handler),
     onMenu: (handler) => subscribe(IPC.events.menu, handler),
+    onOpenPackage: (handler) => subscribe(IPC.events.openPackage, handler),
     onModelProgress: (handler) => subscribe(IPC.events.modelProgress, handler)
   },
   mediaUrl: (filePath: string) => {

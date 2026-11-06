@@ -1,5 +1,5 @@
 /** Settings: AI providers, local models, processing, storage, export, appearance, updates, logs. */
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import clsx from 'clsx'
 import {
   Boxes,
@@ -1170,35 +1170,52 @@ function UpdatesSection(): JSX.Element {
 /* ---------------------------------- logs --------------------------------- */
 
 function LogsSection(): JSX.Element {
-  const [log, setLog] = useState('')
+  const [state, setState] = useState<{ text: string; file: string; bytes: number } | null>(null)
   const [busy, setBusy] = useState(true)
 
-  useEffect(() => {
-    void (async () => {
-      try {
-        // Logs live in the workspace; the main process exposes the folder, and
-        // the renderer reads the newest file through the media protocol.
-        const info = await api.workspace.info()
-        const response = await fetch(`${api.mediaUrl(info.logsDir.replace(/\\/g, '/'))}/app.log`).catch(() => null)
-        const text = response && response.ok ? await response.text() : ''
-        setLog(text.split('\n').slice(-400).join('\n'))
-      } finally {
-        setBusy(false)
-      }
-    })()
+  const load = useCallback(async () => {
+    setBusy(true)
+    try {
+      setState(await api.app.readLogs(400))
+    } catch {
+      setState({ text: '', file: '', bytes: 0 })
+    } finally {
+      setBusy(false)
+    }
   }, [])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const empty = !state || !state.text.trim()
 
   return (
     <div className="stack-md">
       <div className="row">
-        <Button icon={<RefreshCw size={12} />} onClick={() => window.location.reload()} loading={busy}>
-          Reload view
+        <Button icon={<RefreshCw size={12} />} onClick={() => void load()} loading={busy}>
+          Reload
         </Button>
         <Button variant="ghost" icon={<FolderOpen size={12} />} onClick={() => void api.app.openLogs()}>
           Open log folder
         </Button>
+        {state && state.file && (
+          <span className="muted text-xs mono">
+            {state.file.split(/[\\/]/).pop()} · {Math.max(1, Math.round(state.bytes / 1024))} KB
+          </span>
+        )}
       </div>
-      <pre className="log-view mono">{log || 'Log files are in the workspace “Logs” folder — use “Open log folder” to read them.'}</pre>
+      <pre className="log-view mono">
+        {empty
+          ? busy
+            ? 'Loading…'
+            : 'No log entries yet. Diagnostics are written to the workspace “Logs” folder as soon as the app does something worth recording.'
+          : state.text}
+      </pre>
+      <p className="muted text-xs">
+        Logs never contain API keys. Last 400 lines are shown; open the folder for the full history and the rotated
+        previous log.
+      </p>
     </div>
   )
 }

@@ -80,6 +80,21 @@ export function Timeline(): JSX.Element {
   const toggleClipSelection = useEditor((s) => s.toggleClipSelection)
   const setPlayhead = useEditor((s) => s.setPlayhead)
   const setZoom = useEditor((s) => s.setZoom)
+  const fitProject = useCallback(() => {
+    const scroller = scrollRef.current
+    if (!scroller) return
+    const seconds = Math.max(1, (useEditor.getState().duration() || 1000) / 1000)
+    const available = Math.max(120, scroller.clientWidth - HEADER_W - 40)
+    setZoom(clamp((available / seconds) * 1, 6, 900))
+    scroller.scrollLeft = 0
+  }, [setZoom])
+
+  useEffect(() => {
+    // The native Timeline ▸ Fit project in view command dispatches this.
+    const handler = () => fitProject()
+    window.addEventListener('clipwright:fit-timeline', handler)
+    return () => window.removeEventListener('clipwright:fit-timeline', handler)
+  }, [fitProject])
   const setActiveTrack = useEditor((s) => s.setActiveTrack)
   const applyLive = useEditor((s) => s.applyLive)
   const commitHistory = useEditor((s) => s.commitHistory)
@@ -421,16 +436,7 @@ export function Timeline(): JSX.Element {
           <IconButton label="Zoom in" onClick={() => setZoom(zoom * 1.3)}>
             <ZoomIn size={14} />
           </IconButton>
-          <IconButton
-            label="Fit project"
-            onClick={() => {
-              const scroller = scrollRef.current
-              if (!scroller) return
-              const available = scroller.clientWidth - HEADER_W - 40
-              setZoom(clamp((available / secondsDuration) * 1, 6, 900))
-              scroller.scrollLeft = 0
-            }}
-          >
+          <IconButton label="Fit project" onClick={fitProject}>
             <Maximize size={14} />
           </IconButton>
           <div className="divider-v" />
