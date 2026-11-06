@@ -1,0 +1,22 @@
+FFmpeg — bundled binaries
+=========================
+
+Clipwright Studio ships prebuilt ffmpeg.exe and ffprobe.exe (Windows x64) so the
+app can import, decode and export media without asking the user to install
+anything.
+
+Source:      https://ffmpeg.org
+Binary build: Gyan Doshi's "essentials" Windows build (https://www.gyan.dev/ffmpeg/builds/)
+Licence:     LGPL-2.1-or-later for the bundled configuration (see the FFmpeg
+             COPYING.LGPLv2.1); components that are GPL are only present in
+             "full"/"gpl" builds and are not used by Clipwright's command lines.
+
+The exact build hash is recorded in resources/ffmpeg/BUILD.txt inside the
+installed application directory, and the app reports the ffmpeg version it
+detected in Settings → Processing → Detected hardware.
+
+FFmpeg is invoked as a separate executable (subprocess). Clipwright does not
+link against FFmpeg libraries, so its own MIT licence is unaffected.
+
+Corresponding source for the bundled build is available from the URLs above, as
+required by the LGPL.
