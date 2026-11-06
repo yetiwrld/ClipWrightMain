@@ -9,7 +9,29 @@ policy here), no GitHub/npm network beyond the registry, no `root` for `apt`.
 That single constraint is why packaging and the ffmpeg-dependent tests run in CI
 rather than locally.
 
-## 1. Automated tests — 48 passed, 9 skipped
+## 0. Latest status — a real Windows build was produced
+
+GitHub Actions run [42215783621](https://github.com/yetiwrld/ClipWrightMain/actions/runs/42215783621)
+on `windows-latest` completed every step, and the artifacts were published as the
+pre-release `build-c585d1f` (rebuilt as `build-61bdda7` with cleaner file names):
+
+| step | result |
+|---|---|
+| typecheck (main + renderer) | pass |
+| vitest, including the 9 ffmpeg render tests | 57/57 pass on Windows |
+| electron-builder (NSIS per-user + portable) | pass — 139.9 MB setup, 139.6 MB portable |
+| asar contents (`out/main`, `out/preload`, `out/renderer`, `node_modules/fflate`) | pass |
+| bundled `ffmpeg.exe` / `ffprobe.exe` run and report a version | pass |
+| bundled fonts present | pass |
+| **packaged exe boots** (`CLIPWRIGHT_SMOKE=1`, waits for `did-finish-load`) | pass |
+| **real export through the compositor with the bundled ffmpeg** | pass — 1920×1080 h264/yuv420p + aac 48 kHz, 2.00 s |
+| SHA-256 `checksums.txt` published with the assets | pass |
+
+So the installer is no longer "configured but unverified": it was built, the
+packaged application was started, and it encoded a video with the ffmpeg that
+ships inside it.
+
+## 1. Automated tests — 57 passed (48 here, 9 render tests on CI)
 
 `npm test` (vitest, single fork, node environment).
 
@@ -20,7 +42,7 @@ rather than locally.
 | `tests/packages.test.ts` | 4 | `.clipwright` export/import round-trip |
 | `tests/open-package.test.ts` | 3 | file-association argument parsing |
 | `tests/logs.test.ts` | 3 | log tail reading (line window, empty file, live writes) |
-| `tests/render.test.ts` | 9 | **skipped here** — requires a working ffmpeg; runs in CI |
+| `tests/render.test.ts` | 9 | real ffmpeg encodes; run in CI, and locally against ffmpeg 9.0.2 |
 
 Specific invariants asserted (not smoke tests):
 
@@ -115,7 +137,10 @@ runtime instead of lying about it.
 
 ## 5. Known limitations (and what they mean for the user)
 
-- **The Windows binary has not been executed here.** First launch happens on the
+- **The binary has not been executed in this Linux sandbox.** It has been
+  executed on `windows-latest` (see section 0); what remains unverified is a
+  human clicking through the UI, and the NSIS installer itself (the *unpacked*
+  app was launched, not the installer's silent-run flow). First launch happens on the
   CI runner / the user's machine. The workflow asserts the shapes that can be
   checked without a GUI.
 - **Render tests need ffmpeg.** They are skipped locally and executed in CI. They
