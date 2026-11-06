@@ -49,13 +49,16 @@ jobs:
       - name: Export a real video from the build
         run: node scripts/smoke-render.mjs --resources . --out ${{ runner.temp }}/clipwright-smoke.mp4
 
-  # Manual only. Once this branch is merged, `release.yml` becomes the canonical
-  # build (tag-driven, publishes a GitHub Release); GitHub only registers
-  # workflows that exist on the default branch, so the packaging steps live here
-  # too until then.
+  # Runs when a commit asks for it (`[package]` in the message) or by hand.
+  # Once this branch is merged, `release.yml` becomes the canonical build
+  # (tag-driven, publishes a GitHub Release); GitHub only registers workflows
+  # that exist on the default branch, so the packaging steps live here too until
+  # then.
   package:
-    name: Package installer & portable (manual)
-    if: github.event_name == 'workflow_dispatch' && inputs.package
+    name: Package installer & portable
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.package) ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, '[package]'))
     needs: verify
     runs-on: windows-latest
     steps:
@@ -129,3 +132,31 @@ jobs:
             release/*.yml
             release/checksums.txt
           if-no-files-found: error
+
+      - name: Publish a downloadable build
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[package]')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A pre-release, so the in-app updater (which reads "latest" releases)
+          # ignores test builds and real versions stay in control of release.yml.
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $tag = "build-$short"
+          $notes = @"
+          Automated Windows x64 build of commit $($env:GITHUB_SHA).
+
+          Assets:
+          - ``Clipwright Studio-Setup-1.0.0-x64.exe`` — per-user installer (no admin prompt)
+          - ``Clipwright Studio-Portable-1.0.0-x64.exe`` — single file, no install
+          - ``checksums.txt`` — SHA-256 for each file
+
+          This build is unsigned, so Windows SmartScreen will warn on first run: choose
+          "More info" → "Run anyway", and compare the hash against checksums.txt first.
+          "@
+          $notes | Set-Content release/notes.md
+          $assets = @(Get-ChildItem release -File | Where-Object { $_.Name -match 'Setup|Portable|checksums\.txt|\.blockmap$|latest\.yml' } | ForEach-Object { $_.FullName })
+          if (Test-Path "release/notes.md") { $assets += (Get-Item 'release/notes.md').FullName }
+          gh release create $tag --target $env:GITHUB_SHA --prerelease --title "Clipwright Studio (build $short)" --notes-file release/notes.md @assets
+          Write-Host "released $tag"
+
