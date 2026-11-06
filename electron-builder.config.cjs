@@ -17,7 +17,10 @@ module.exports = {
   appId: 'studio.clipwright.app',
   productName: 'Clipwright Studio',
   copyright: `Copyright © ${new Date().getFullYear()} Clipwright Studio`,
-  artifactName: '${productName}-${version}-${arch}-${os}.${ext}',
+  // Explicit hyphenated names: electron-builder rewrites spaces in an artifact
+  // name to dots, which makes "Clipwright Studio-Setup-…" turn into
+  // "Clipwright.Studio-Setup-…" — awkward in links and shell commands.
+  artifactName: 'Clipwright-Studio-${version}-${arch}-${os}.${ext}',
 
   directories: {
     output: 'release',
@@ -90,12 +93,12 @@ module.exports = {
     installerIcon: path.join(root, 'build', 'icon.ico'),
     uninstallerIcon: path.join(root, 'build', 'icon.ico'),
     installerHeaderIcon: path.join(root, 'build', 'icon.ico'),
-    artifactName: '${productName}-Setup-${version}-${arch}.${ext}',
+    artifactName: 'Clipwright-Studio-Setup-${version}-${arch}.${ext}',
     include: 'build/installer.nsh'
   },
 
   portable: {
-    artifactName: '${productName}-Portable-${version}-${arch}.${ext}',
+    artifactName: 'Clipwright-Studio-Portable-${version}-${arch}.${ext}',
     unpackDirName: 'ClipwrightStudio'
   },
 
