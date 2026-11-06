@@ -47,6 +47,9 @@ jobs:
       - name: Unit / integration / renderer tests
         run: npm test
 
+      - name: Build (catches bundling mistakes types cannot see)
+        run: npm run build
+
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v4
@@ -104,16 +107,48 @@ jobs:
           $lines | Set-Content release/checksums.txt
           Get-Content release/checksums.txt
 
-      - name: Verify packaged app contents
+      - name: Verify assembly (asar + bundled binaries + fonts)
         shell: pwsh
         run: |
-          # Sanity-check the asar contains the compiled main process and that the
-          # bundled ffmpeg actually runs — a green build that cannot encode is
-          # worse than a red one.
-          npx asar list release/win-unpacked/resources/app.asar | Select-String 'out\\main\\index.js'
-          & 'release/win-unpacked/resources/ffmpeg/ffmpeg.exe' -version | Select-Object -First 1
-          & 'release/win-unpacked/resources/ffmpeg/ffprobe.exe' -version | Select-Object -First 1
-          if (Test-Path 'release/win-unpacked/resources/app.asar') { Write-Host 'asar present' }
+          # A green build that cannot encode is worse than a red one.
+          if (-not (Test-Path 'release/win-unpacked/resources/app.asar')) { throw 'app.asar is missing' }
+          $listing = npx asar list release/win-unpacked/resources/app.asar
+          foreach ($required in @('out\main\index.js', 'out\preload\index.js', 'out\renderer\index.html')) {
+            if (-not ($listing -match [regex]::Escape($required))) { throw "$required is not inside app.asar" }
+          }
+          if (-not ($listing -match 'node_modules\\fflate')) { throw 'fflate runtime dependency was not packaged' }
+          Write-Host 'asar looks complete'
+          foreach ($exe in @('ffmpeg.exe', 'ffprobe.exe')) {
+            $path = "release/win-unpacked/resources/ffmpeg/$exe"
+            if (-not (Test-Path $path)) { throw "$exe was not bundled" }
+            $size = (Get-Item $path).Length / 1MB
+            if ($size -lt 10) { throw "$exe is only $([math]::Round($size,1)) MB" }
+            & $path -hide_banner -version | Select-Object -First 1
+          }
+          $fonts = (Get-ChildItem release/win-unpacked/resources/fonts -Filter *.ttf).Count
+          if ($fonts -lt 1) { throw 'no fonts were bundled' }
+          Write-Host "$fonts bundled fonts"
+
+      - name: Smoke-test the packaged app (boot + real export)
+        shell: pwsh
+        run: |
+          # 1. Boot the actual exe and prove the renderer loaded.
+          $env:CLIPWRIGHT_SMOKE = '1'
+          $proc = Start-Process -FilePath 'release/win-unpacked/Clipwright Studio.exe' -PassThru
+          if (-not $proc.WaitForExit(120000)) {
+            $proc.Kill()
+            throw 'packaged app did not exit within 120s — the renderer never finished loading'
+          }
+          $proc.Refresh()
+          $code = $proc.ExitCode
+          Remove-Item Env:\CLIPWRIGHT_SMOKE
+          # A single-instance lockfile from the smoke run must not block the export test.
+          Get-Process | Where-Object { $_.ProcessName -like '*Clipwright*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+          if ($code -ne 0) { throw "packaged app failed to boot (exit code $code)" }
+          Write-Host 'packaged app booted and loaded its renderer'
+
+          # 2. Render a real video through the real compositor with the bundled ffmpeg.
+          node scripts/smoke-render.mjs --resources release/win-unpacked/resources --out $env:RUNNER_TEMP/clipwright-smoke.mp4
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -137,7 +172,7 @@ jobs:
           $signed = if ($env:CSC_LINK) { 'This build is code-signed.' } else { 'This build is UNSIGNED. Windows SmartScreen will warn on first run — verify checksums.txt before installing.' }
           $body = "Native Windows x64 installer and portable build of Clipwright Studio.`n`n$signed`n`nEvery asset is listed in checksums.txt (SHA-256). The app verifies this checksum before running an update.`n`nSee docs/VERIFICATION.md for the test and packaging report."
           $body | Set-Content release/notes.md
-          $assets = @(Get-ChildItem release -File | Where-Object { $_.Name -match 'Setup|Portable|checksums\.txt|latest\.yml' } | ForEach-Object { $_.FullName })
+          $assets = @(Get-ChildItem release -File | Where-Object { $_.Name -match 'Setup|Portable|checksums\.txt|latest\.yml|\.blockmap$' } | ForEach-Object { $_.FullName })
           gh release create $tag --title "Clipwright Studio $tag" --notes-file release/notes.md @assets
 
   verify-artifacts:

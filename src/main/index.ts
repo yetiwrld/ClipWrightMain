@@ -77,6 +77,36 @@ function createWindow(): BrowserWindow {
     }
   })
 
+  // CI: `CLIPWRIGHT_SMOKE=1` makes the packaged app boot, report that the
+  // renderer loaded, and exit. Exit code 0 means the real exe started and its
+  // bundle is intact; anything else fails the build.
+  if (process.env.CLIPWRIGHT_SMOKE === '1') {
+    const timer = setTimeout(
+      () => {
+        log.error('smoke', 'renderer did not load within 60s')
+        app.exit(1)
+      },
+      60_000
+    )
+    win.webContents.once('did-finish-load', () => {
+      setTimeout(() => {
+        clearTimeout(timer)
+        log.info('smoke', `packaged app booted (${APP_NAME} ${app.getVersion()})`)
+        app.exit(0)
+      }, 1500)
+    })
+    win.webContents.once('did-fail-load', (_e, code, description) => {
+      clearTimeout(timer)
+      log.error('smoke', `renderer failed to load: ${code} ${description}`)
+      app.exit(1)
+    })
+    win.webContents.on('render-process-gone', (_e, details) => {
+      clearTimeout(timer)
+      log.error('smoke', `render process gone: ${details.reason}`)
+      app.exit(1)
+    })
+  }
+
   win.once('ready-to-show', () => {
     win.show()
     if (process.env.CLIPWRIGHT_DEVTOOLS === '1') win.webContents.openDevTools({ mode: 'detach' })
