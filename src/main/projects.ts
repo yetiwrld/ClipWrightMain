@@ -19,11 +19,14 @@ import { SCHEMA_VERSION, createProject } from '@shared/defaults'
 import { baseClip } from '@shared/timeline'
 import type { Project, ProjectMeta } from '@shared/types'
 import { log } from './logger'
-import { zipSync, unzipSync } from 'fflate'
+import { Zip, ZipPassThrough, unzipSync } from 'fflate'
 
 const strToBytes = (value: string): Uint8Array => new Uint8Array(Buffer.from(value, 'utf8'))
 
 const MAX_RECOVERY_SNAPSHOTS = 5
+/** Refuse absurd packages before inflating them (zip-bomb guard). */
+const MAX_PACKAGE_ENTRIES = 5_000
+const MAX_PACKAGE_BYTES = 8 * 1_073_741_824
 /**
  * Minimum gap between recovery snapshots of the same project.
  *
@@ -94,7 +97,28 @@ export function loadProject(id: string): Project {
 
 function migrate(project: Project): Project {
   let next = project
-  if ((next.schemaVersion ?? 0) < SCHEMA_VERSION) {
+  const from = next.schemaVersion ?? 0
+  if (from < SCHEMA_VERSION) {
+    /*
+     * Bumping the version without transforming anything relabelled an old
+     * document as current, so its missing fields surfaced later as undefined
+     * crashes. Each step below is the actual transform for that version; an
+     * unknown (older) document is filled in from the defaults rather than
+     * trusted.
+     */
+    log.info('projects', `migrating ${project.id} from schema ${from || 'pre-1'} to ${SCHEMA_VERSION}`)
+    if (from < 1) {
+      const fresh = createProject(next.name, next.canvas?.aspect ?? '16:9', next.fps ?? 30)
+      next = {
+        ...fresh,
+        ...next,
+        canvas: { ...fresh.canvas, ...(next.canvas ?? {}) },
+        tracks: next.tracks?.length ? next.tracks : fresh.tracks,
+        clips: next.clips ?? [],
+        assets: next.assets ?? [],
+        markers: next.markers ?? []
+      }
+    }
     next = { ...next, schemaVersion: SCHEMA_VERSION }
   }
   // Fill in fields added by later versions without touching user data.
@@ -294,15 +318,41 @@ export function remove(id: string, deleteMedia = false): void {
   removeRecoveryFor(id)
   const dir = projectDir(id)
   if (!fs.existsSync(dir)) return
-  if (deleteMedia) {
-    fs.rmSync(dir, { recursive: true, force: true })
-    return
+  /*
+   * Remove the directory itself. This used to leave `media/` behind when
+   * deleteMedia was false ("referenced files may be used by other projects"),
+   * but media copies live inside their own project folder, so the only thing it
+   * achieved was orphaned folders full of megabytes that nothing could reach.
+   */
+  fs.rmSync(dir, { recursive: true, force: true })
+  void deleteMedia
+}
+
+/**
+ * Delete project folders that have no project.json.
+ *
+ * A crash between `mkdir` and the first save, or the old `remove()` above, leaves
+ * these: gigabytes of media in a folder no screen will ever show. Runs once at
+ * startup; returns how many folders were removed.
+ */
+export function sweepOrphanedProjects(dryRun = false): string[] {
+  const root = workspaceLayout().projects
+  if (!fs.existsSync(root)) return []
+  const removed: string[] = []
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue
+    const dir = path.join(root, entry.name)
+    if (fs.existsSync(path.join(dir, 'project.json'))) continue
+    removed.push(entry.name)
+    if (dryRun) continue
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+      log.info('projects', `removed orphaned project folder ${entry.name}`)
+    } catch (error) {
+      log.warn('projects', `could not remove orphaned folder ${entry.name}: ${String(error)}`)
+    }
   }
-  // Keep the media folder: referenced files may be used by other projects.
-  for (const entry of fs.readdirSync(dir)) {
-    if (entry === 'media') continue
-    fs.rmSync(path.join(dir, entry), { force: true })
-  }
+  return removed
 }
 
 /** Delete every recovery point belonging to a project. */
@@ -361,7 +411,16 @@ export async function exportPackage(id: string, includeMedia = true): Promise<st
     })
   }
 
-  const entries: Record<string, Uint8Array> = {}
+  /*
+   * Media is streamed straight into the zip (stored, not deflated — it is already
+   * compressed). It used to be read into memory and zipped with `zipSync`, so a
+   * project with a few GB of managed media exhausted the main process heap.
+   */
+  enum EntryKind {
+    File,
+    Text
+  }
+  const plan: { name: string; kind: EntryKind; source: string }[] = []
   let totalBytes = 0
   const mediaFiles: string[] = []
 
@@ -370,39 +429,79 @@ export async function exportPackage(id: string, includeMedia = true): Promise<st
       if (asset.storage !== 'managed') continue
       if (!fs.existsSync(asset.path)) continue
       const name = path.basename(asset.path)
-      const bytes = await fsp.readFile(asset.path)
-      // Media is already compressed; store it rather than inflating the package
-      // size (and the time) for no gain.
-      entries[`media/${name}`] = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+      plan.push({ name: `media/${name}`, kind: EntryKind.File, source: asset.path })
       mediaFiles.push(`media/${name}`)
-      totalBytes += bytes.byteLength
+      totalBytes += fs.statSync(asset.path).size
     }
   }
 
-  entries['project.json'] = strToBytes(
-    JSON.stringify(
-      {
-        kind: 'clipwright-package',
-        version: 1,
-        app: 'Clipwright Studio',
-        exportedAt: Date.now(),
-        includeMedia,
-        totalBytes,
-        mediaFiles,
-        project: packaged
-      },
-      null,
-      2
-    )
+  const manifestText = JSON.stringify(
+    {
+      kind: 'clipwright-package',
+      version: 1,
+      app: 'Clipwright Studio',
+      exportedAt: Date.now(),
+      includeMedia,
+      totalBytes,
+      mediaFiles,
+      project: packaged
+    },
+    null,
+    2
   )
   for (const extra of ['transcript.json', 'moments.json']) {
     const source = path.join(projectDir(id), extra)
-    if (fs.existsSync(source)) entries[extra] = new Uint8Array(await fsp.readFile(source))
+    if (fs.existsSync(source)) plan.push({ name: extra, kind: EntryKind.File, source })
   }
 
-  const archive = zipSync(entries, { level: 0 })
-  await fsp.writeFile(target, archive)
-  log.info('projects', `exported package ${path.basename(target)} (${(archive.byteLength / 1_048_576).toFixed(1)} MB, media=${includeMedia})`)
+  // Stream: one entry at a time, stored (level 0), nothing held in memory.
+  await new Promise<void>((resolve, reject) => {
+    const output = fs.createWriteStream(target)
+    output.on('error', reject)
+    output.on('finish', () => resolve())
+    const archive = new Zip((error, chunk) => {
+      if (error) {
+        output.destroy(error)
+        return
+      }
+      if (chunk) output.write(Buffer.from(chunk))
+    })
+    const queue: { name: string; file?: string; text?: string }[] = [
+      ...plan.map((entry) => ({ name: entry.name, file: entry.source })),
+      { name: 'project.json', text: manifestText }
+    ]
+    let index = 0
+    const next = () => {
+      const entry = queue[index++]
+      if (!entry) {
+        archive.end()
+        output.end()
+        return
+      }
+      // ZipPassThrough stores the bytes as-is: media is already compressed.
+      const stream = new ZipPassThrough(entry.name)
+      archive.add(stream)
+      if (entry.text !== undefined) {
+        stream.push(strToBytes(entry.text), true)
+        next()
+        return
+      }
+      const input = fs.createReadStream(entry.file!)
+      input.on('data', (chunk) => stream.push(new Uint8Array(chunk as Buffer)))
+      input.on('end', () => {
+        stream.push(new Uint8Array(0), true)
+        next()
+      })
+      input.on('error', (error) => reject(error))
+    }
+    next()
+  })
+  const size = fs.statSync(target).size
+  log.info(
+    'projects',
+    `exported package ${path.basename(target)} (${(size / 1_048_576).toFixed(1)} MB, ` +
+      `${plan.length + 1} entries, media=${includeMedia ? mediaFiles.length : 0})`
+  )
   return target
 }
 
@@ -426,9 +525,33 @@ export async function importPackage(packagePath: string): Promise<Project> {
       throw new Error('That is not a Clipwright package — expected a .clipwright file.')
     }
     try {
-      archive = unzipSync(new Uint8Array(await fsp.readFile(packagePath)))
-    } catch {
-      throw new Error('That .clipwright file is damaged or is not a Clipwright package.')
+      const raw = new Uint8Array(await fsp.readFile(packagePath))
+      const names = listZipEntries(raw)
+      /*
+       * Cap the entry count and the declared uncompressed total before inflating
+       * anything. A malicious .clipwright that expands to terabytes used to be
+       * read entirely into memory.
+       */
+      if (names.length > MAX_PACKAGE_ENTRIES) {
+        throw new Error(`That package contains ${names.length} files, which is more than a project can have.`)
+      }
+      const declared = declaredUncompressedBytes(raw)
+      if (declared > MAX_PACKAGE_BYTES) {
+        throw new Error(
+          `That package declares ${(declared / 1_073_741_824).toFixed(1)} GB of contents, which is too large to import.`
+        )
+      }
+      archive = unzipSync(raw)
+      const expanded = Object.values(archive).reduce((total, bytes) => total + bytes.byteLength, 0)
+      if (expanded > MAX_PACKAGE_BYTES) {
+        throw new Error('That package expands to more data than a project import can hold.')
+      }
+    } catch (error) {
+      throw new Error(
+        error instanceof Error && /package (contains|expands|declares)/.test(error.message)
+          ? error.message
+          : 'That .clipwright file is damaged or is not a Clipwright package.'
+      )
     }
     const manifest = Object.keys(archive).find((name) => name === 'project.json' || name.endsWith('/project.json'))
     if (!manifest) throw new Error('That package has no project.json — it may be corrupt.')
@@ -439,6 +562,7 @@ export async function importPackage(packagePath: string): Promise<Project> {
   }
 
   const raw = manifestBytes ?? new Uint8Array(await fsp.readFile(manifestFile))
+  if (raw.byteLength > MAX_PACKAGE_BYTES / 100) throw new Error('That project manifest is implausibly large.')
   const manifest = JSON.parse(Buffer.from(raw).toString('utf8')) as {
     kind?: string
     project?: Project
@@ -527,4 +651,60 @@ export function blankProject(): Project {
   }
   void baseClip
   return project
+}
+
+/* ------------------------------------------------------------------ */
+/* Zip inspection                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Read the central directory of a zip and return the entry names.
+ *
+ * Enough to bound a package without inflating it: a name count and the declared
+ * uncompressed sizes come straight out of the directory.
+ */
+export function listZipEntries(data: Uint8Array): string[] {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+  const eocd = findEndOfCentralDirectory(view)
+  if (eocd < 0) throw new Error('not a zip')
+  const count = view.getUint16(eocd + 10, true)
+  let offset = view.getUint32(eocd + 16, true)
+  const names: string[] = []
+  for (let i = 0; i < count && offset + 46 <= data.byteLength; i++) {
+    if (view.getUint32(offset, true) !== 0x02014b50) break
+    const nameLength = view.getUint16(offset + 28, true)
+    const extraLength = view.getUint16(offset + 30, true)
+    const commentLength = view.getUint16(offset + 32, true)
+    const name = Buffer.from(data.subarray(offset + 46, offset + 46 + nameLength)).toString('utf8')
+    names.push(name)
+    offset += 46 + nameLength + extraLength + commentLength
+  }
+  return names
+}
+
+/** Total uncompressed size declared by the central directory. */
+export function declaredUncompressedBytes(data: Uint8Array): number {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+  const eocd = findEndOfCentralDirectory(view)
+  if (eocd < 0) return 0
+  const count = view.getUint16(eocd + 10, true)
+  let offset = view.getUint32(eocd + 16, true)
+  let total = 0
+  for (let i = 0; i < count && offset + 46 <= data.byteLength; i++) {
+    if (view.getUint32(offset, true) !== 0x02014b50) break
+    total += view.getUint32(offset + 24, true)
+    const nameLength = view.getUint16(offset + 28, true)
+    const extraLength = view.getUint16(offset + 30, true)
+    const commentLength = view.getUint16(offset + 32, true)
+    offset += 46 + nameLength + extraLength + commentLength
+  }
+  return total
+}
+
+function findEndOfCentralDirectory(view: DataView): number {
+  const minimum = Math.max(0, view.byteLength - 66_000)
+  for (let i = view.byteLength - 22; i >= minimum; i--) {
+    if (view.getUint32(i, true) === 0x06054b50) return i
+  }
+  return -1
 }

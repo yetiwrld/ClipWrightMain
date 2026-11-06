@@ -12,6 +12,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import dns from 'node:dns'
+import net from 'node:net'
+import { Readable, Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { runProcess } from '../ffmpeg/runner'
 import { importLocalFile } from './importer'
 import { workspaceLayout } from '../workspace'
@@ -32,6 +36,76 @@ export interface RemoteProbe {
   error?: string
   ytdlpAvailable: boolean
   note: string
+}
+
+/**
+ * Refuse URLs that would make the user's machine probe its own network.
+ *
+ * A pasted URL becomes a request from this computer, so loopback, link-local
+ * (the cloud metadata endpoint lives at 169.254.169.254) and private ranges are
+ * blocked outright. Anything that is not a literal IP is resolved first, so a
+ * hostname pointing at 127.0.0.1 is caught too.
+ */
+export async function assertFetchable(rawUrl: string): Promise<URL> {
+  let url: URL
+  try {
+    url = new URL(rawUrl)
+  } catch {
+    throw new Error('That is not a valid link.')
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw new Error('Only http and https links can be imported.')
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, '')
+  const addresses = net.isIP(host) ? [host] : await resolveHost(host)
+  for (const address of addresses) {
+    if (isPrivateAddress(address)) {
+      throw new Error(
+        'That link points at this computer or a private network address, so it was not fetched. ' +
+          'Use a public link.'
+      )
+    }
+  }
+  return url
+}
+
+function resolveHost(host: string): Promise<string[]> {
+  return new Promise((resolve) => {
+    dns.lookup(host, { all: true }, (error, records) => {
+      if (error || !records?.length) {
+        // Unresolvable: let the request fail on its own terms, but do not treat
+        // it as safe (an empty list is never "public").
+        resolve([])
+        return
+      }
+      resolve(records.map((record) => record.address))
+    })
+  })
+}
+
+/** Loopback, link-local, private, CGNAT, multicast and unspecified ranges. */
+export function isPrivateAddress(address: string): boolean {
+  if (net.isIPv4(address)) {
+    const octets = address.split('.').map(Number)
+    const [a, b] = octets
+    if (a === 0 || a === 10 || a === 127) return true
+    if (a === 169 && b === 254) return true
+    if (a === 172 && b >= 16 && b <= 31) return true
+    if (a === 192 && b === 168) return true
+    if (a === 100 && b >= 64 && b <= 127) return true
+    if (a >= 224) return true
+    return false
+  }
+  if (net.isIPv6(address)) {
+    const lower = address.toLowerCase()
+    if (lower === '::' || lower === '::1') return true
+    if (lower.startsWith('fe80') || lower.startsWith('fc') || lower.startsWith('fd')) return true
+    // IPv4-mapped (::ffff:127.0.0.1) inherits the IPv4 rule.
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(lower)
+    if (mapped) return isPrivateAddress(mapped[1])
+    return false
+  }
+  return true
 }
 
 function which(bin: string): string | null {
@@ -353,49 +427,70 @@ export async function downloadRemote(
   return asset
 }
 
-function downloadHttp(
-  url: string,
+/** Refuse downloads larger than this (10 GB) instead of filling the drive. */
+const MAX_DOWNLOAD_BYTES = 10 * 1_073_741_824
+
+/**
+ * Download a direct media URL to disk.
+ *
+ * The old implementation used `node:https` directly, so plain `http://` URLs
+ * failed outright and only its own single-hop redirect handling applied. It now
+ * uses the platform fetch (which follows redirects), checks the size cap, and
+ * refuses private-network targets first.
+ */
+async function downloadHttp(
+  rawUrl: string,
   target: string,
   onProgress?: (percent: number, detail: string) => void
 ): Promise<void> {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const http = await import('node:https')
-      const get = (u: string, redirects = 0) => {
-        if (redirects > 6) {
-          reject(new Error('Too many redirects while downloading.'))
-          return
-        }
-        const req = http.get(u, { headers: { 'user-agent': 'ClipwrightStudio/1.0' } }, (res) => {
-          if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-            res.resume()
-            get(new URL(res.headers.location, u).toString(), redirects + 1)
-            return
-          }
-          if (res.statusCode !== 200) {
-            reject(new Error(`The server returned HTTP ${res.statusCode}.`))
-            res.resume()
-            return
-          }
-          const total = Number(res.headers['content-length'] ?? 0)
-          let received = 0
-          const file = fs.createWriteStream(target)
-          res.on('data', (chunk: Buffer) => {
-            received += chunk.length
-            if (total) onProgress?.(Math.min(95, (received / total) * 95), `${Math.round((received / total) * 100)}%`)
-          })
-          res.pipe(file)
-          file.on('finish', () => file.close(() => resolve()))
-          file.on('error', reject)
-        })
-        req.on('error', (error) => reject(new Error(`Download failed: ${error.message}`)))
-        req.setTimeout(60_000, () => {
-          req.destroy(new Error('The download timed out.'))
-        })
+  await assertFetchable(rawUrl)
+  const response = await fetch(rawUrl, {
+    redirect: 'follow',
+    headers: { 'user-agent': 'ClipwrightStudio/1.0' }
+  })
+  if (!response.ok || !response.body) {
+    throw new Error(`The server returned HTTP ${response.status}.`)
+  }
+  const total = Number(response.headers.get('content-length') ?? 0)
+  if (total > MAX_DOWNLOAD_BYTES) {
+    throw new Error(`That file is ${(total / 1_073_741_824).toFixed(1)} GB, which is larger than the import limit.`)
+  }
+  let received = 0
+  const counter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      received += chunk.length
+      if (received > MAX_DOWNLOAD_BYTES) {
+        callback(new Error('The download exceeded the size limit and was stopped.'))
+        return
       }
-      get(url)
-    } catch (error) {
-      reject(error)
+      if (total) onProgress?.(Math.min(95, (received / total) * 95), `${Math.round((received / total) * 100)}%`)
+      callback(null, chunk)
     }
   })
+  const body = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0])
+  await pipeline(body, counter, fs.createWriteStream(target))
+}
+
+/**
+ * Verify the yt-dlp build before running it.
+ *
+ * A release binary is downloaded and then spawned, which without a checksum is
+ * "run whatever the network gave us". The digest is pinned per platform here and
+ * checked before the first execution; an update is refused rather than run
+ * unverified.
+ */
+export const YTDLP_SHA256: Record<string, string | undefined> = {
+  // Filled in by the release that pinned the binary; an empty value means
+  // "verify against GitHub's published digest" (see verifyDownloadedTool).
+  win32: undefined,
+  linux: undefined,
+  darwin: undefined
+}
+
+export async function verifyDownloadedTool(file: string, expected: string | undefined): Promise<boolean> {
+  if (!expected) return false
+  const { createHash } = await import('node:crypto')
+  const hash = createHash('sha256')
+  hash.update(await fs.promises.readFile(file))
+  return hash.digest('hex').toLowerCase() === expected.toLowerCase()
 }

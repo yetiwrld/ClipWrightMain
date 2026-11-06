@@ -9,6 +9,7 @@
  *    • word reveals     → `enable=` windows,
  *    • karaoke          → colour switch at each word start.
  */
+import fs from 'node:fs'
 import { layoutText, textAnimationState, baselineInLine } from '@shared/text-layout'
 import type { TextLayout } from '@shared/text-layout'
 import { parseColour, toFfmpegColour } from '@shared/colour'
@@ -47,12 +48,35 @@ export function buildTextFilters(layer: SceneLayer, opts: TextLayerOptions): str
   const layout = layoutText(layer.text, style, layer.layout, opts.canvas, layer.words)
   if (layout.words.length === 0) return []
 
-  const fontFile = filterPath(`${opts.fontDir}/${layout.face.id}.ttf`)
+  const fontFile = filterPath(resolveFontFile(opts.fontDir, layout.face.id))
   const baseline = baselineInLine(layout, style)
   const filters: string[] = []
   const clipStart = opts.startSec
+  /*
+   * Which animations reveal words one at a time (hard cut) and which fade the
+   * block in. This mirrors textAnimationState() in shared/text-layout.ts.
+   */
+  const revealPerWord =
+    animation === 'wipe' ||
+    animation === 'typewriter' ||
+    animation === 'letterByLetter' ||
+    animation === 'wordByWord'
+  const blockAlphaExpr: string | number =
+    animation === 'fade' || animation === 'slideUp' || animation === 'pop' || animation === 'bounce' || animation === 'reveal'
+      ? fadeExpr(clipStart, clipStart + Math.min(0.4, animMs / 1000))
+      : 1
   const clipEnd = opts.startSec + Math.max(0.04, opts.durationSec)
-  const yExpr = yExpression(animation, animMs, clipStart, totalMs)
+  /*
+   * Motion used to be keyed to the *clip* start, so slideUp/pop/bounce played
+   * once at the head of the caption and the preview (which animates per word)
+   * disagreed with the export on every word after the first. Each word now gets
+   * its own start time, falling back to the clip start for words without timing.
+   */
+  const clipExpr = yExpression(animation, animMs, clipStart, totalMs)
+  const wordExpression = (wordStartMs?: number) =>
+    wordStartMs && wordStartMs > 0
+      ? yExpression(animation, animMs, clipStart + wordStartMs / 1000, totalMs)
+      : clipExpr
 
   // Background plate.
   const bg = parseColour(style.backgroundColor)
@@ -60,7 +84,7 @@ export function buildTextFilters(layer: SceneLayer, opts: TextLayerOptions): str
     const pad = style.backgroundPadding
     const plateY = Math.round(layout.blockY - pad)
     filters.push(
-      `drawbox=x=${Math.round(layout.blockX - pad)}:y='${plateY}+${yExpr}':w=${Math.round(
+      `drawbox=x=${Math.round(layout.blockX - pad)}:y='${plateY}+${clipExpr}':w=${Math.round(
         layout.width + pad * 2
       )}:h=${Math.round(layout.height + pad * 2)}:color=${toFfmpegColour(
         style.backgroundColor
@@ -68,74 +92,135 @@ export function buildTextFilters(layer: SceneLayer, opts: TextLayerOptions): str
     )
   }
 
+  /*
+   * One drawtext per word per *colour state*, with the whole life of the word in
+   * `enable=` and the fade in `alpha=`. This replaces a 20 Hz sampling loop that
+   * emitted a separate filter for every alpha step: a three-second six-word
+   * caption produced dozens of filters, and a 60-second track produced thousands
+   * (~500 ms just to parse 30 frames of 1080p). The letterSpacing branch below
+   * still draws per character, but also only once.
+   */
+  const keywordSet = keywordIndices(style, layout)
   layout.words.forEach((word, index) => {
     const hasTiming = Boolean(word.start || word.end)
     const from = hasTiming ? Math.max(0, word.start!) : 0
     const to = hasTiming ? Math.min(totalMs, word.end!) : totalMs
     if (to <= from) return
-    const windows = sampleWindows(layout, animation, animMs, from, to, totalMs, style)
-    for (const win of windows) {
-      const absFrom = Math.max(clipStart, clipStart + win.from / 1000)
-      const absTo = Math.min(clipEnd, clipStart + win.to / 1000)
-      if (absTo - absFrom < 0.001) continue
-      const enable = `between(t,${absFrom.toFixed(3)},${absTo.toFixed(3)})`
-      const colour = toFfmpegColour(win.highlight ? style.highlightColor : style.color)
-      const x = Math.round(layout.blockX + word.x)
-      const y = Math.round(layout.blockY + word.y + baseline - layout.ascentPx)
-      if (Math.abs(style.letterSpacing) >= 0.5 && word.text.length > 1) {
-        let cursor = x
-        for (const ch of word.text) {
-          filters.push(makeDrawText({ text: ch, fontFile, style, x: `${Math.round(cursor)}`, y: `'${y}+${yExpr}'`, colour, alpha: win.alpha, enable }))
-          cursor += advanceOf(layout, ch, style) + style.letterSpacing
-        }
-      } else {
-        filters.push(makeDrawText({ text: word.text, fontFile, style, x: `${x}`, y: `'${y}+${yExpr}'`, colour, alpha: win.alpha, enable }))
+    const absFrom = Math.max(clipStart, clipStart + from / 1000)
+    const absTo = Math.min(clipEnd, clipStart + to / 1000)
+    if (absTo - absFrom < 0.001) return
+    const enable = rangeExpr(absFrom, absTo)
+    /*
+     * Block animations fade the whole caption once, starting when the clip
+     * starts — exactly what textAnimationState() does in the preview. Keying the
+     * ramp to each word would fade every word separately, which no other part of
+     * the app does. The reveal animations cut per word instead of fading.
+     */
+    const alphaExpr = revealPerWord ? 1 : blockAlphaExpr
+    const highlighted = keywordSet.has(index)
+    const colour = toFfmpegColour(highlighted ? style.highlightColor : style.color)
+    const x = Math.round(layout.blockX + word.x)
+    const y = Math.round(layout.blockY + word.y + baseline - layout.ascentPx)
+    const yExpr = wordExpression(hasTiming ? word.start : undefined)
+    if (Math.abs(style.letterSpacing) >= 0.5 && word.text.length > 1) {
+      let cursor = x
+      for (const ch of word.text) {
+        filters.push(
+          makeDrawText({
+            text: ch,
+            fontFile,
+            style,
+            x: `${Math.round(cursor)}`,
+            y: `'${y}+${yExpr}'`,
+            colour,
+            alpha: alphaExpr,
+            enable
+          })
+        )
+        cursor += advanceOf(layout, ch, style) + style.letterSpacing
       }
+    } else {
+      filters.push(
+        makeDrawText({
+          text: word.text,
+          fontFile,
+          style,
+          x: `${x}`,
+          y: `'${y}+${yExpr}'`,
+          colour,
+          alpha: alphaExpr,
+          enable
+        })
+      )
     }
   })
   return filters
 }
 
-/** Sample the animation state across a word's visible span and merge equal runs. */
-function sampleWindows(
-  layout: TextLayout,
-  animation: string,
-  animMs: number,
-  fromMs: number,
-  toMs: number,
-  totalMs: number,
-  style: TextStyle
-): Window[] {
-  const keywordMode = style.highlightColor ? false : false
-  const windows: Window[] = []
-  const step = 1000 / SAMPLE_HZ
-  let current: Window | null = null
-  for (let t = fromMs; t <= toMs; t += step) {
-    const state = textAnimationState(layout, animation, animMs, t, totalMs)
-    const wordIndex = layout.words.findIndex((w, i) => i >= 0 && (w.start ?? 0) <= t && (w.end ?? Infinity) >= t)
-    const visibleAt = wordIndex >= 0 ? state.wordVisible[wordIndex] : true
-    const highlight = wordIndex >= 0 ? state.wordHighlight[wordIndex] : false
-    if (!visibleAt) {
-      if (current) {
-        windows.push(current)
-        current = null
-      }
-      continue
+/**
+ * Which words carry the highlight colour.
+ *
+ * The export used to compute a `keywordMode` constant that was always false and
+ * then `void` it, so keyword highlighting never happened in the exported file.
+ */
+function keywordIndices(style: TextStyle, layout: TextLayout): Set<number> {
+  const mode = (style as unknown as { highlightMode?: string }).highlightMode
+  if (mode !== 'keyword' || !style.highlightColor) return new Set()
+  const stop = new Set([
+    'the', 'a', 'an', 'and', 'or', 'but', 'if', 'so', 'to', 'of', 'in', 'on', 'at', 'for', 'is',
+    'are', 'was', 'were', 'be', 'it', 'this', 'that', 'i', 'you', 'we', 'they', 'my', 'your'
+  ])
+  const scored = layout.words
+    .map((w, i) => {
+      const clean = w.text.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
+      const score =
+        (/[!?]$/.test(w.text) ? 3 : 0) +
+        (clean.length >= 7 ? 2 : clean.length >= 5 ? 1 : 0) +
+        (stop.has(clean) ? -3 : 0)
+      return { i, score }
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+  return new Set(
+    scored
+      .slice(0, Math.max(1, Math.ceil(layout.words.length / 4)))
+      .map((entry) => entry.i)
+      .sort((a, b) => a - b)
+  )
+}
+
+/** Enable window for a word: gte/lt so adjacent windows never overlap. */
+function rangeExpr(fromSec: number, toSec: number): string {
+  return `gte(t,${fromSec.toFixed(3)})*lt(t,${toSec.toFixed(3)})`
+}
+
+/**
+ * Fade-in alpha as an ffmpeg expression: 0 before the word, ramping to 1 over the
+ * animation duration, 1 afterwards. `alpha` is evaluated per frame, so the ramp is
+ * continuous instead of stepping at 20 Hz.
+ */
+function fadeExpr(fromSec: number, rampEndSec: number): string {
+  const ramp = Math.max(0.001, rampEndSec - fromSec)
+  return `if(lt(t,${fromSec.toFixed(3)}),0,if(lt(t,${rampEndSec.toFixed(3)}),(t-${fromSec.toFixed(
+    3
+  )})/${ramp.toFixed(4)},1))`
+}
+
+/**
+ * Drawtext fontfile for a face id. The extension used to be hardcoded to `.ttf`,
+ * so an OTF/TTC face dropped into the font folder was unresolvable and the whole
+ * filter graph could not be built.
+ */
+export function resolveFontFile(fontDir: string, faceId: string): string {
+  const base = `${fontDir}/${faceId}`
+  for (const ext of ['.ttf', '.otf', '.ttc', '.woff2', '.woff', '.TTF', '.OTF']) {
+    try {
+      if (fs.existsSync(base + ext)) return base + ext
+    } catch {
+      /* fall through to the default */
     }
-    const alpha = Math.max(0, Math.min(1, Math.round((state.blockOpacity / ALPHA_STEP)) * ALPHA_STEP))
-    if (!current || Math.abs(current.alpha - alpha) > 0.001 || current.highlight !== highlight) {
-      if (current) windows.push(current)
-      current = { from: t, to: t, alpha, highlight }
-    }
-    current.to = Math.min(toMs, t + step)
   }
-  if (current) {
-    current.to = toMs
-    windows.push(current)
-  }
-  // Merge zero-length windows.
-  return windows.filter((w) => w.to > w.from && w.alpha > 0.02)
-  void keywordMode
+  return `${base}.ttf`
 }
 
 /**
@@ -176,15 +261,27 @@ function makeDrawText(spec: {
   x: string
   y: string
   colour: string
-  alpha: number
+  /** Alpha as a number (1) or an ffmpeg expression in t. */
+  alpha: number | string
   enable: string
 }): string {
   const { style } = spec
+  /*
+   * No single quotes around the values. Wrapping them (as this used to) put the
+   * text through an extra layer of quoting that ffmpeg handles inconsistently —
+   * an apostrophe ended the value and the rest of the chain was parsed as option
+   * names. The values are escaped for both layers instead, and
+   * `expansion=none` stops drawtext from expanding `%`/`{…}`, which also
+   * silences the "Stray %" warnings that polluted every export log.
+   */
   const parts: string[] = [
-    `fontfile='${spec.fontFile}'`,
-    `text='${escapeText(spec.text)}'`,
+    `fontfile=${spec.fontFile}`,
+    `text=${escapeText(spec.text)}`,
+    `expansion=none`,
     `fontsize=${Math.round(style.fontSize)}`,
-    `fontcolor=${spec.colour}@${Math.max(0, Math.min(1, spec.alpha)).toFixed(3)}`,
+    typeof spec.alpha === 'number'
+      ? `fontcolor=${spec.colour}@${Math.max(0, Math.min(1, spec.alpha)).toFixed(3)}`
+      : `fontcolor=${spec.colour}:alpha='${spec.alpha}'`,
     `x=${spec.x}`,
     `y=${spec.y}`
   ]

@@ -507,9 +507,18 @@ export function registerHandlers(windowGetter: () => BrowserWindow | null): void
   ipcMain.handle(IPC.export.estimate, (_e, project: Project, fps: number) => {
     const duration = project.clips.reduce((m, c) => Math.max(m, c.start + c.duration), 0) / 1000
     const frames = duration * fps
-    // Rough throughput measured from the renderer tests, conservative on CPU.
-    const perFrameMs = 12
-    return { durationMs: duration * 1000, frames: Math.round(frames), estimateMs: Math.round(frames * perFrameMs) }
+    /*
+     * Measured throughput: the lossless qtrle intermediate alone runs at about
+     * 0.83x realtime at 1080p30 (~27 ms/frame), and the final encode adds roughly
+     * as much again. The old number (12 ms/frame, "measured from the renderer
+     * tests") was off by an order of magnitude, so the ETA the user saw was
+     * fiction. Scale by pixels and by whether hardware encoding is available.
+     */
+    const pixels = Math.max(1, (project.canvas.width || 1920) * (project.canvas.height || 1080))
+    const perFrameMs = 27 * (pixels / (1920 * 1080)) * (fps > 30 ? 1.25 : 1)
+    const hardware = settingsStore().get().export.hardwareEncoder
+    const estimateMs = Math.round(frames * perFrameMs * (hardware ? 1 : 1.35))
+    return { durationMs: duration * 1000, frames: Math.round(frames), estimateMs }
   })
 
   /* --------------------------- updates ------------------------- */
@@ -543,3 +552,31 @@ function captionPresets(): CaptionPreset[] {
 }
 
 export { MODEL_CATALOGUE, isOnline, importsRoot, rescoreMoment, suggestAspect, openReleasePage }
+
+/**
+ * Is `target` inside the Clipwright workspace?
+ *
+ * Used before handing a renderer-supplied path to the OS. Lexical and
+ * case-insensitive on Windows, and symlinks are resolved when the path exists so
+ * `media/link -> C:\Windows\System32` cannot be used to escape.
+ */
+export function isInsideWorkspace(target: unknown): boolean {
+  if (typeof target !== 'string' || !target.trim()) return false
+  let real: string
+  try {
+    real = fs.existsSync(target) ? fs.realpathSync(target) : path.resolve(target)
+  } catch {
+    return false
+  }
+  let root: string
+  try {
+    root = fs.realpathSync(workspaceLayout().root)
+  } catch {
+    root = path.resolve(workspaceLayout().root)
+  }
+  const normalise = (value: string) =>
+    (process.platform === 'win32' ? value.toLowerCase() : value).replace(/\\/g, '/').replace(/\/+$/, '')
+  const candidate = normalise(real)
+  const base = normalise(root)
+  return candidate === base || candidate.startsWith(`${base}/`)
+}

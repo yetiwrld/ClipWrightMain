@@ -41,13 +41,29 @@ function piecewise(
   const first = points[0]
   const tail = points[points.length - 1]
   const pieces: string[] = []
+  /*
+   * Half-open intervals. `between(t,a,b)` is inclusive at *both* ends, and the
+   * samples are emitted end to end, so the shared boundary frame evaluated two
+   * neighbouring pieces and summed them: measured 98 → 214 → 0 across a boundary
+   * at 10 fps. That is one doubled position/alpha frame every 66 ms — visible
+   * judder and flicker on every animated clip. Only the final piece closes with
+   * `lte`, so the curve still reaches its last sample.
+   */
   for (let i = 0; i < points.length - 1; i++) {
     const a = points[i]
     const b = points[i + 1]
     if (b.t <= a.t) continue
     const slope = (b.v - a.v) / (b.t - a.t)
     const intercept = a.v - slope * a.t
-    pieces.push(`between(t,${a.t.toFixed(3)},${b.t.toFixed(3)})*(${slope.toFixed(5)}*t+${intercept.toFixed(5)})`)
+    const slopeText = slope.toFixed(5)
+    const interceptText = intercept.toFixed(5)
+    const term = `(${slopeText}*t+${interceptText})`
+    const last = i === points.length - 2
+    pieces.push(
+      last
+        ? `gte(t,${a.t.toFixed(3)})*lte(t,${b.t.toFixed(3)})*${term}`
+        : `gte(t,${a.t.toFixed(3)})*lt(t,${b.t.toFixed(3)})*${term}`
+    )
   }
   return `if(lt(t,${first.t.toFixed(3)}),${first.v.toFixed(4)},if(gt(t,${tail.t.toFixed(3)}),${tail.v.toFixed(4)},${pieces.join('+')}))`
 }

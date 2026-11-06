@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events'
 import { DEFAULT_SETTINGS, deepMerge } from '@shared/defaults'
 import type { Settings } from '@shared/types'
 import { configDir, defaultWorkspaceRoot } from './paths'
+import { applyWorkspaceRoot } from './workspace'
 
 /**
  * Settings store: a single JSON file in the app-data folder. API keys are NOT
@@ -48,7 +49,21 @@ export class SettingsStore extends EventEmitter {
     return merged
   }
 
+  /**
+   * A frozen copy of the settings.
+   *
+   * This used to hand out the live object, so any caller could mutate store
+   * state directly — bypassing the debounced atomic write and never emitting the
+   * `changed` event that other parts of the app listen to. A frozen clone makes
+   * that mistake a visible error instead of silent drift; `update()` is the only
+   * way to change settings.
+   */
   get(): Settings {
+    return deepFreeze(structuredClone(this.data))
+  }
+
+  /** The live object, for the store's own bookkeeping. Never expose this. */
+  private raw(): Settings {
     return this.data
   }
 
@@ -60,6 +75,7 @@ export class SettingsStore extends EventEmitter {
   }
 
   reset(section?: keyof Settings): Settings {
+    const previousRoot = this.data.storage.workspaceRoot
     if (section) {
       this.data = { ...this.data, [section]: structuredClone(DEFAULT_SETTINGS[section]) }
     } else {
@@ -67,9 +83,21 @@ export class SettingsStore extends EventEmitter {
       this.data.storage.workspaceRoot = defaultWorkspaceRoot()
       this.data.export.outputDir = path.join(defaultWorkspaceRoot(), 'Exports')
     }
+    /*
+     * workspace.ts caches the resolved root in module scope, so changing
+     * storage.workspaceRoot here left it pointing at the old tree until restart.
+     * Apply the new root through the workspace module so the cache follows.
+     */
+    if (this.data.storage.workspaceRoot !== previousRoot) {
+      try {
+        applyWorkspaceRoot(this.data.storage.workspaceRoot)
+      } catch {
+        /* the folder may be gone; the caller sees the error on next use */
+      }
+    }
     this.saveNow()
     this.emit('changed', this.data)
-    return this.data
+    return this.get()
   }
 
   private scheduleSave(): void {
@@ -96,4 +124,15 @@ let instance: SettingsStore | null = null
 export function settingsStore(): SettingsStore {
   if (!instance) instance = new SettingsStore()
   return instance
+}
+
+/** Recursively freeze a plain object graph (settings are JSON-shaped). */
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value)
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      deepFreeze((value as Record<string, unknown>)[key])
+    }
+  }
+  return value
 }

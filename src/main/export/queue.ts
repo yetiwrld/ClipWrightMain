@@ -7,7 +7,7 @@
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import path from 'node:path'
-import { ProjectRenderer } from './renderer'
+import { ProjectRenderer, buildAudioRenderArgs } from './renderer'
 import { validateExport } from './validation'
 import { buildExportPreset } from '@shared/presets'
 import { canvasSizeFor } from '@shared/presets'
@@ -30,12 +30,19 @@ export interface QueueDeps {
 interface InternalJob extends ExportJob {
   request: ExportRequest
   abort?: AbortController
+  /**
+   * Queue order. Jobs used to be sorted by `id`, which is random — so a batch
+   * export ran in whatever order the random strings happened to sort in, not the
+   * order the user queued it.
+   */
+  seq: number
 }
 
 export class ExportQueue extends EventEmitter {
   private jobs: InternalJob[] = []
   private running: InternalJob | null = null
   private maxConcurrent = 1
+  private nextSeq = 1
   private deps: QueueDeps
 
   constructor(deps: QueueDeps) {
@@ -49,9 +56,10 @@ export class ExportQueue extends EventEmitter {
   }
 
   private publicJob(job: InternalJob): ExportJob {
-    const { request, abort, ...rest } = job
+    const { request, abort, seq, ...rest } = job
     void request
     void abort
+    void seq
     return rest
   }
 
@@ -99,7 +107,8 @@ export class ExportQueue extends EventEmitter {
       height: preset.height,
       fps: preset.fps,
       request: { ...request, outputDir },
-      abort: new AbortController()
+      abort: new AbortController(),
+      seq: this.nextSeq++
     }
     this.jobs.unshift(job)
     this.emit('update', this.publicJob(job))
@@ -139,7 +148,7 @@ export class ExportQueue extends EventEmitter {
 
   private pump(): void {
     if (this.running) return
-    const next = this.jobs.filter((j) => j.status === 'queued').sort((a, b) => a.id.localeCompare(b.id))[0]
+    const next = this.jobs.filter((j) => j.status === 'queued').sort((a, b) => a.seq - b.seq)[0]
     if (!next) return
     this.running = next
     void this.run(next).finally(() => {
@@ -150,6 +159,7 @@ export class ExportQueue extends EventEmitter {
 
   private async run(job: InternalJob): Promise<void> {
     const started = Date.now()
+    const tempDir = path.join(workspaceLayout().temp, job.id)
     job.status = 'preparing'
     job.startedAt = started
     job.progress = 1
@@ -180,7 +190,6 @@ export class ExportQueue extends EventEmitter {
       job.status = 'rendering'
       this.emit('update', this.publicJob(job))
 
-      const tempDir = path.join(workspaceLayout().temp, job.id)
       const renderer = new ProjectRenderer(
         {
           project: renderProject,
@@ -230,10 +239,31 @@ export class ExportQueue extends EventEmitter {
           width: preset.width,
           height: preset.height,
           fps: preset.fps,
-          durationMs: range ? range.end - range.start : project.clips.reduce((m, c) => Math.max(m, c.start + c.duration), 0),
+          /*
+           * Reduce over the project that was actually rendered. With a
+           * `clipIds` batch export `range` is undefined, and the old fallback
+           * summed *all* clips, so every "export selected clips" job reported a
+           * duration mismatch and was marked failed.
+           */
+          durationMs: range
+            ? range.end - range.start
+            : renderProject.clips.reduce((m, c) => Math.max(m, c.start + c.duration), 0),
           aspect
         },
-        requireAudio: project.assets.some((a) => a.probe.hasAudio)
+        /*
+         * Ask the audio graph, not the asset list. One muted or unused video with
+         * an audio stream used to make a silent export "fail" with "The output
+         * has no audio stream."
+         */
+        requireAudio:
+          buildAudioRenderArgs(
+            renderProject,
+            range ?? {
+              start: 0,
+              end: renderProject.clips.reduce((m, c) => Math.max(m, c.start + c.duration), 0)
+            },
+            path.join(tempDir, 'probe.wav')
+          ) !== null
       })
       job.validation = validation
       if (!validation.ok) {
@@ -246,18 +276,31 @@ export class ExportQueue extends EventEmitter {
       job.finishedAt = Date.now()
       this.emit('update', this.publicJob(job))
       log.info('export', `job ${job.id} ${job.status} → ${job.outputPath}`)
-      // Clean up the render temp folder.
+    } catch (error) {
+      /*
+       * A cancel aborts the running ffmpeg, which makes it exit non-zero and
+       * throw here. Overwriting the status with 'failed' meant a cancelled export
+       * always looked like a crash in the UI.
+       */
+      const aborted = job.abort?.signal.aborted === true
+      const cancelled = aborted || (job.status as string) === 'cancelled'
+      job.status = cancelled ? 'cancelled' : 'failed'
+      job.error = cancelled ? undefined : error instanceof Error ? error.message : String(error)
+      job.finishedAt = Date.now()
+      this.emit('update', this.publicJob(job))
+      if (job.status === 'cancelled') log.info('export', `job ${job.id} cancelled`)
+      else log.error('export', `job ${job.id} threw: ${job.error}`)
+    } finally {
+      /*
+       * Cleanup used to live on the success path only, so every failed export
+       * left its lossless ARGB segments behind — gigabytes per failure, and
+       * nothing ever collected them.
+       */
       try {
         fs.rmSync(tempDir, { recursive: true, force: true })
       } catch {
         /* ignore */
       }
-    } catch (error) {
-      job.status = 'failed'
-      job.error = error instanceof Error ? error.message : String(error)
-      job.finishedAt = Date.now()
-      this.emit('update', this.publicJob(job))
-      log.error('export', `job ${job.id} threw: ${job.error}`)
     }
   }
 }

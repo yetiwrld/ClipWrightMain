@@ -55,11 +55,38 @@ class Logger {
     // eslint-disable-next-line no-console
     if (level === 'error') console.error(line)
     else console.log(line)
+    /*
+     * Buffered, flushed on a timer. This used to be an appendFileSync on the main
+     * thread for every line — including every mirrored renderer console message,
+     * hundreds of which arrived during export rendering. A write that fails is
+     * dropped (logging must never break the operation that logged).
+     */
+    this.buffer.push(`${line}\n`)
+    if (this.buffer.length >= 200) this.flush()
+    else this.scheduleFlush()
+  }
+
+  private buffer: string[] = []
+  private flushTimer: NodeJS.Timeout | null = null
+
+  private scheduleFlush(): void {
+    if (this.flushTimer) return
+    this.flushTimer = setTimeout(() => this.flush(), 500)
+    // Never hold the process open just for a log line.
+    this.flushTimer.unref?.()
+  }
+
+  flush(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = null
+    }
+    if (!this.buffer.length) return
+    const pending = this.buffer.join('')
+    this.buffer = []
     try {
       const file = this.target()
-      // Logging must never crash the app, and must never break an operation that
-      // happened to log something.
-      if (file) fs.appendFileSync(file, `${line}\n`)
+      if (file) fs.appendFileSync(file, pending)
     } catch {
       /* ignore */
     }
@@ -95,5 +122,7 @@ export const log = {
   warn: (scope: string, message: string, extra?: unknown) => logger().warn(scope, message, extra),
   error: (scope: string, message: string, extra?: unknown) => logger().error(scope, message, extra),
   debug: (scope: string, message: string, extra?: unknown) => logger().debug(scope, message, extra),
+  /** Write any buffered lines immediately (log viewer, shutdown, crash report). */
+  flush: () => logger().flush(),
   path: () => logger().logPath()
 }

@@ -216,8 +216,13 @@ export async function downloadModel(
       const { done, value } = await reader.read()
       if (done) break
       if (value) {
-        stream.write(Buffer.from(value))
-        hash.update(Buffer.from(value))
+        const buffer = Buffer.from(value)
+        // Respect backpressure. The write() result was ignored and nothing waited
+        // for 'drain', so a multi-GB model download piled up in memory.
+        if (!stream.write(buffer)) {
+          await new Promise<void>((resolve) => stream.once('drain', () => resolve()))
+        }
+        hash.update(buffer)
         received += value.length
         const now = Date.now()
         if (now - lastEmit > 250) {
@@ -234,6 +239,12 @@ export async function downloadModel(
     }
     await new Promise<void>((resolve) => stream.end(resolve))
     onProgress({ modelId: id, receivedBytes: received, totalBytes: total, percent: 99, status: 'verifying' })
+    /*
+     * Verify when the catalogue publishes a digest. Most entries still do not
+     * (audit item P2-10) — the digests have to come from the publisher, not be
+     * invented, so this stays conditional until they are filled in. The
+     * `installedModels()` state is honest about what is on disk either way.
+     */
     if (def.sha256) {
       const digest = hash.digest('hex')
       if (digest !== def.sha256) {

@@ -398,26 +398,36 @@ export function Timeline(): JSX.Element {
     }
   }, [marquee, project, trackList, zoom, scrollLeft, selectClips, commitHistory])
 
-  /* ctrl+wheel zooms at the cursor, shift+wheel scrolls horizontally */
-  const onWheel = (event: React.WheelEvent) => {
+  /*
+   * Wheel handlers on a scrollable element are passive by default in Chromium, so
+   * preventDefault() inside them was ignored and logged a warning hundreds of
+   * times per session ("preventDefault inside passive event listener"), on top of
+   * the browser also scrolling the container. React cannot mark an event passive
+   * either way, so the handler is bound natively with `{ passive: false }`.
+   */
+  useEffect(() => {
     const scroller = scrollRef.current
     if (!scroller) return
-    if (event.ctrlKey || event.metaKey) {
-      event.preventDefault()
-      const anchor = timeAt(event.clientX)
-      const nextZoom = clamp(zoom * (event.deltaY < 0 ? 1.12 : 1 / 1.12), 6, 900)
-      const localX = event.clientX - scroller.getBoundingClientRect().left - HEADER_W
-      setZoom(nextZoom)
-      requestAnimationFrame(() => {
-        scroller.scrollLeft = Math.max(0, (anchor / 1000) * nextZoom - localX)
-      })
-      return
+    const handler = (event: WheelEvent) => {
+      if (event.ctrlKey || event.metaKey) {
+        event.preventDefault()
+        const anchor = timeAt(event.clientX)
+        const nextZoom = clamp(zoom * (event.deltaY < 0 ? 1.12 : 1 / 1.12), 6, 900)
+        const localX = event.clientX - scroller.getBoundingClientRect().left - HEADER_W
+        setZoom(nextZoom)
+        requestAnimationFrame(() => {
+          scroller.scrollLeft = Math.max(0, (anchor / 1000) * nextZoom - localX)
+        })
+        return
+      }
+      if (event.shiftKey) {
+        event.preventDefault()
+        scroller.scrollLeft += event.deltaY
+      }
     }
-    if (event.shiftKey) {
-      scroller.scrollLeft += event.deltaY
-      event.preventDefault()
-    }
-  }
+    scroller.addEventListener('wheel', handler, { passive: false })
+    return () => scroller.removeEventListener('wheel', handler)
+  }, [zoom, timeAt])
 
   const updateClipAudio = (id: string, patch: Partial<Clip['audio']>) => {
     useEditor.getState().apply(
@@ -567,7 +577,7 @@ export function Timeline(): JSX.Element {
         </div>
       </div>
 
-      <div className="timeline__scroll" ref={scrollRef} onWheel={onWheel} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
+      <div className="timeline__scroll" ref={scrollRef} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
         <div className="timeline__inner" style={{ width: HEADER_W + timelineWidth }}>
           <div className="timeline__ruler" style={{ paddingLeft: HEADER_W }}>
             <div className="timeline__ruler-inner" style={{ width: timelineWidth }}>

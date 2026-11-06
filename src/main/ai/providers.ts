@@ -225,7 +225,14 @@ export async function chat(
   provider: ProviderConfig,
   apiKey: string | undefined,
   messages: ChatMessage[],
-  opts: { json?: boolean; maxTokens?: number; temperature?: number; signal?: AbortSignal } = {}
+  opts: {
+    json?: boolean
+    maxTokens?: number
+    temperature?: number
+    signal?: AbortSignal
+    /** Per-request timeout; defaults to two minutes. */
+    timeoutMs?: number
+  } = {}
 ): Promise<ChatResult> {
   const base = provider.baseUrl.replace(/\/$/, '')
   const headers: Record<string, string> = { 'content-type': 'application/json' }
@@ -246,7 +253,12 @@ export async function chat(
         .map((m) => ({ role: m.role, content: m.content }))
     }
   } else if (provider.kind === 'gemini') {
-    url = `${base}/models/${encodeURIComponent(provider.model)}:generateContent?key=${encodeURIComponent(apiKey ?? '')}`
+    /*
+     * The key goes in a header, not the query string. A URL-borne key leaks into
+     * logs, proxies, crash reports and any error surface that prints the request.
+     */
+    url = `${base}/models/${encodeURIComponent(provider.model)}:generateContent`
+    if (apiKey) headers['x-goog-api-key'] = apiKey
     body = {
       contents: messages.map((m) => ({
         role: m.role === 'assistant' ? 'model' : 'user',
@@ -270,12 +282,28 @@ export async function chat(
     }
   }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal: opts.signal
-  })
+  /*
+   * A provider that accepts the connection and then hangs used to hold the UI
+   * spinner forever: the only signal was whatever the caller passed, and most
+   * callers passed nothing. Every request now has a hard timeout, combined with
+   * the caller's own cancellation signal when there is one.
+   */
+  const timeout = AbortSignal.timeout(opts.timeoutMs ?? 120_000)
+  const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal
+    })
+  } catch (error) {
+    if (timeout.aborted) {
+      throw new Error('The provider did not respond in time. Check the connection or try a smaller request.')
+    }
+    throw error
+  }
   if (!response.ok) {
     const text = await response.text()
     throw new Error(describeHttpError(response.status, text))
@@ -359,7 +387,9 @@ export async function listModels(provider: ProviderConfig, apiKey: string | unde
     return (json.data ?? []).map((m) => m.id)
   }
   if (provider.kind === 'gemini') {
-    const res = await fetch(`${base}/models?key=${encodeURIComponent(apiKey ?? '')}`)
+    const res = await fetch(`${base}/models`, {
+      headers: apiKey ? { 'x-goog-api-key': apiKey } : {}
+    })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const json = (await res.json()) as { models?: { name: string }[] }
     return (json.models ?? []).map((m) => m.name.replace(/^models\//, ''))

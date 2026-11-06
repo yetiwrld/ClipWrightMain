@@ -127,10 +127,33 @@ export function transitionAlpha(
   }
 }
 
+/**
+ * Clips bucketed by track and sorted by start time, cached per project object.
+ *
+ * buildScene runs once per preview frame, and it used to filter and re-sort the
+ * whole clip list for every track on every call — thousands of sorts per second
+ * with a few hundred clips. The cache is keyed on the project reference, which
+ * the store replaces on every edit, so it is never stale.
+ */
+const clipCache = new WeakMap<Project, Map<string, Clip[]>>()
+
+function clipsForTrack(project: Project, trackId: string): Clip[] {
+  let byTrack = clipCache.get(project)
+  if (!byTrack) {
+    byTrack = new Map()
+    for (const clip of project.clips) {
+      const list = byTrack.get(clip.trackId)
+      if (list) list.push(clip)
+      else byTrack.set(clip.trackId, [clip])
+    }
+    for (const list of byTrack.values()) list.sort((a, b) => a.start - b.start)
+    clipCache.set(project, byTrack)
+  }
+  return byTrack.get(trackId) ?? []
+}
+
 function buildLayers(project: Project, track: Project['tracks'][number], time: number): SceneLayer[] {
-  const clips = project.clips
-    .filter((c) => c.trackId === track.id)
-    .sort((a, b) => a.start - b.start)
+  const clips = clipsForTrack(project, track.id)
   const layers: SceneLayer[] = []
 
   for (const clip of clips) {
@@ -217,7 +240,12 @@ export function buildScene(project: Project, time: number): Scene {
   for (const track of ordered) {
     if (!track.visible) continue
     if ((track.kind as string) === 'audio') continue
-    if (soloed && !track.solo && (track.kind === 'video' || track.kind === 'audio')) continue
+    /*
+     * Soloing is "only this track". The kind test here used to exclude captions,
+     * text and graphics, so soloing a video track still drew every caption over
+     * it — the opposite of what the button says.
+     */
+    if (soloed && !track.solo) continue
     layers.push(...buildLayers(project, track, time))
   }
   return {

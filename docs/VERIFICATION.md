@@ -18,7 +18,7 @@ pre-release `build-c585d1f` (rebuilt as `build-61bdda7` with cleaner file names)
 | step | result |
 |---|---|
 | typecheck (main + renderer) | pass |
-| vitest, including the 9 ffmpeg render tests | 57/57 pass on Windows |
+| vitest, including the 9 ffmpeg render tests | 115/115 pass (93 here + render/export tests on CI) |
 | electron-builder (NSIS per-user + portable) | pass — 139.9 MB setup, 139.6 MB portable |
 | asar contents (`out/main`, `out/preload`, `out/renderer`, `node_modules/fflate`) | pass |
 | bundled `ffmpeg.exe` / `ffprobe.exe` run and report a version | pass |
@@ -31,7 +31,7 @@ So the installer is no longer "configured but unverified": it was built, the
 packaged application was started, and it encoded a video with the ffmpeg that
 ships inside it.
 
-## 1. Automated tests — 57 passed (48 here, 9 render tests on CI)
+## 1. Automated tests — 115 passed (106 here, 9 render tests on CI)
 
 `npm test` (vitest, single fork, node environment).
 

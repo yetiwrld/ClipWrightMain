@@ -60,8 +60,10 @@ export function groupWordsIntoCaptions(
       flush()
     }
     current.push(word)
-    // Break after strong sentence punctuation.
-    if (/[.!?…]$/.test(word.text) && current.length >= 2) flush()
+    // Break after strong sentence punctuation. A one-word sentence ("No.")
+    // used to merge into the following line because the break required
+    // current.length >= 2.
+    if (/[.!?…]$/.test(word.text)) flush()
   }
   flush()
   return groups.filter((g) => g.words.length > 0)
@@ -102,14 +104,21 @@ export function buildCaptionClips(
   const groups = groupWordsIntoCaptions(words, preset.wordsPerLine)
   return groups.map((group) => {
     const clip = baseClip('caption', trackId, group.words.map((w) => w.text).join(' '))
-    clip.start = Math.max(0, group.start + timeOffset)
+    /*
+     * A group that starts before the range was clamped at 0 for the clip but its
+     * words kept their raw offset, so word timings drifted out of the clip and
+     * every later word highlighted at the wrong moment. Clamping the group start
+     * once and shifting the words by the same amount keeps them aligned.
+     */
+    const shift = Math.max(timeOffset, -group.start)
+    clip.start = Math.max(0, group.start + shift)
     clip.duration = Math.max(400, group.end - group.start)
     clip.sourceIn = 0
     clip.text = group.words.map((w) => w.text).join(' ')
     clip.words = group.words.map((w) => ({
       ...w,
-      start: w.start + timeOffset,
-      end: w.end + timeOffset
+      start: Math.max(0, w.start + shift),
+      end: Math.max(0, w.end + shift)
     }))
     clip.style = { ...preset.style }
     clip.layout = { ...preset.layout }
@@ -140,7 +149,15 @@ export function pickKeywordIndices(words: CaptionWord[]): number[] {
     })
     .filter((s) => s.score > 0)
     .sort((a, b) => b.score - a.score)
-  return scored.slice(0, Math.max(1, Math.ceil(words.length / 4))).map((s) => s.i)
+  /*
+   * Sorted by relevance to *choose*, then returned in word order: consumers
+   * treat these as positions, and a descending-relevance list highlighted the
+   * wrong words.
+   */
+  return scored
+    .slice(0, Math.max(1, Math.ceil(words.length / 4)))
+    .map((s) => s.i)
+    .sort((a, b) => a - b)
 }
 
 export function presetById(id: string | undefined, presets: CaptionPreset[]): CaptionPreset {
@@ -156,10 +173,16 @@ export function presetById(id: string | undefined, presets: CaptionPreset[]): Ca
 /* ------------------------------------------------------------------ */
 
 function srtTime(ms: number): string {
-  const h = Math.floor(ms / 3600000)
-  const m = Math.floor(ms / 60000) % 60
-  const s = Math.floor(ms / 1000) % 60
-  const msec = Math.round(ms % 1000)
+  /*
+   * Round first, then split. Rounding only the millisecond remainder produced
+   * four-digit fields like "00:00:01,1000" for 1999.7 ms — and the carry into
+   * seconds never happened, so players rejected or mis-timed the cue.
+   */
+  const total = Math.max(0, Math.round(ms))
+  const h = Math.floor(total / 3600000)
+  const m = Math.floor(total / 60000) % 60
+  const s = Math.floor(total / 1000) % 60
+  const msec = total % 1000
   const p = (n: number, w = 2) => String(n).padStart(w, '0')
   return `${p(h)}:${p(m)}:${p(s)},${p(msec, 3)}`
 }

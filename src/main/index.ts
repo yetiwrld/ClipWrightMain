@@ -117,7 +117,13 @@ function createWindow(): BrowserWindow {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      /*
+       * With the sandbox off, any renderer code-execution bug reaches a full Node
+       * realm through the preload. The preload only uses contextBridge and
+       * ipcRenderer, both of which work sandboxed, so there is nothing left that
+       * needs the unsandboxed realm.
+       */
+      sandbox: true,
       webSecurity: true,
       spellcheck: false
     }
@@ -203,10 +209,18 @@ function createWindow(): BrowserWindow {
     return { action: 'deny' }
   })
 
+  /*
+   * Top-level navigation is limited to the dev server during development.
+   * `clipwright-media://` used to be allowed here, which let the window be
+   * navigated to any local HTML file with the preload bridge still attached —
+   * arbitrary local HTML with access to window.clipwright. The media scheme is
+   * served through protocol.handle only; it is never a navigation target.
+   */
   win.webContents.on('will-navigate', (event, url) => {
-    const allowed = process.env.ELECTRON_RENDERER_URL
-    if (allowed && url.startsWith(allowed)) return
-    if (url.startsWith('clipwright-media://')) return
+    const devUrl = process.env.ELECTRON_RENDERER_URL
+    const appUrl = pathToFileURL(path.join(__dirname, '../renderer/index.html')).toString()
+    if (devUrl && url.startsWith(devUrl)) return
+    if (!devUrl && url === appUrl) return
     event.preventDefault()
     if (/^https:\/\//.test(url)) void shell.openExternal(url)
   })
@@ -239,16 +253,24 @@ app.whenReady().then(boot).catch((error: unknown) => {
 async function boot(): Promise<void> {
   log.info('app', `starting ${APP_NAME} ${app.getVersion()} on ${process.platform}/${process.arch}`)
 
-  // Media protocol: only allow files inside the workspace or explicitly opened paths.
-  protocol.handle('clipwright-media', (request) => {
+  /*
+   * Media protocol. The comment here always said "only allow files inside the
+   * workspace", but the code checked nothing except that the path existed — so
+   * clipwright-media://<any local file>, including the app's own vault.json, was
+   * a readable URL from the renderer. Paths are now resolved through realpath and
+   * must sit inside the workspace (or an asset the project actually references).
+   */
+  protocol.handle('clipwright-media', async (request) => {
     try {
       const url = new URL(request.url)
       const filePath = decodeURIComponent(url.pathname.replace(/^\//, ''))
-      const normalised = path.normalize(filePath)
-      if (!fs.existsSync(normalised)) {
-        return new Response('Not found', { status: 404 })
+      const resolved = await resolveMediaPath(filePath)
+      if (!resolved) {
+        log.warn('media', `refused to serve a path outside the workspace: ${filePath}`)
+        return new Response('Forbidden', { status: 403 })
       }
-      return net.fetch(pathToFileURL(normalised).toString())
+      if (!fs.existsSync(resolved)) return new Response('Not found', { status: 404 })
+      return net.fetch(pathToFileURL(resolved).toString())
     } catch (error) {
       log.warn('media', `protocol error: ${String(error)}`)
       return new Response('Bad request', { status: 400 })
@@ -256,6 +278,18 @@ async function boot(): Promise<void> {
   })
 
   vault()
+  /*
+   * Folders under Projects/ with no project.json are debris: a crash between
+   * mkdir and the first save, or the old remove() that deliberately kept media/
+   * behind. Nothing can reach them, and they hold gigabytes.
+   */
+  try {
+    const { sweepOrphanedProjects } = await import('./projects')
+    const swept = sweepOrphanedProjects()
+    if (swept.length) log.info('app', `removed ${swept.length} orphaned project folder(s) at startup`)
+  } catch (error) {
+    log.warn('app', `orphan sweep failed: ${String(error)}`)
+  }
   registerHandlers(() => mainWindow)
   mainWindow = createWindow()
 
@@ -329,3 +363,36 @@ process.on('unhandledRejection', (reason) => {
 })
 
 export { IPC, AppInfo }
+
+/**
+ * Confine `clipwright-media://` to files the app owns.
+ *
+ * Returns the canonical path when it is inside the workspace, or `undefined`
+ * when it is not. `realpath` is used so `..` segments and symlinks cannot escape
+ * the workspace root, and both paths are compared after normalising separators
+ * and case — Windows paths are case-insensitive.
+ */
+export async function resolveMediaPath(raw: string): Promise<string | undefined> {
+  if (!raw) return undefined
+  let real: string
+  try {
+    real = await fs.promises.realpath(path.resolve(raw))
+  } catch {
+    // Missing files are still checked lexically so a 404 cannot be used as an
+    // existence oracle for files outside the workspace.
+    real = path.resolve(raw)
+  }
+  let root: string
+  try {
+    root = await fs.promises.realpath(workspaceRoot())
+  } catch {
+    root = path.resolve(workspaceRoot())
+  }
+  const normalise = (value: string) =>
+    process.platform === 'win32' ? value.replace(/\\/g, '/').toLowerCase() : value.replace(/\\/g, '/')
+  const target = normalise(real)
+  const base = normalise(root)
+  if (target === base) return real
+  if (!target.startsWith(base.endsWith('/') ? base : `${base}/`)) return undefined
+  return real
+}

@@ -86,6 +86,10 @@ export function fromProbeJson(json: FFProbeJson): MediaProbe {
   return {
     kind,
     durationMs: durationMs || 0,
+    // Per-stream durations: the container duration is the longest stream, so
+    // comparing audio to video needs the two on their own.
+    audioDurationMs: audio?.duration ? Math.round(Number(audio.duration) * 1000) : undefined,
+    videoDurationMs: video?.duration ? Math.round(Number(video.duration) * 1000) : undefined,
     width,
     height,
     fps: fps ? Math.round(fps * 1000) / 1000 : undefined,
@@ -162,12 +166,27 @@ export async function ffmpegVersion(): Promise<string | undefined> {
   return /ffmpeg version (\S+)/.exec(result.stdout)?.[1]
 }
 
+/**
+ * Parse an `ffmpeg -encoders` listing into encoder names.
+ *
+ * ffmpeg indents every row by six characters (`" V....D libx264 ..."`), so an
+ * unanchored or space-less pattern matches nothing. That single mistake made the
+ * capability report say `"encoders":"none"` on every machine, which in turn left
+ * the export guard seeing no NVENC and trying hardware encoding anyway.
+ *
+ * Exported so the parser can be tested against a captured listing instead of
+ * whatever ffmpeg happens to be installed on the test machine.
+ */
+export function parseEncoders(listing: string): string[] {
+  return listing
+    .split('\n')
+    .map((line) => /^\s*[VAS][.A-Z]{5}\s+(\S+)/.exec(line)?.[1])
+    .filter((name): name is string => Boolean(name) && name !== '=')
+}
+
 export async function availableEncoders(): Promise<string[]> {
   const tools = findFFmpeg()
   if (!tools.ffmpeg) return []
   const result = await runProcess(tools.ffmpeg, ['-hide_banner', '-encoders'], { timeoutMs: 20_000 })
-  return result.stdout
-    .split('\n')
-    .map((line) => /^(?:V|A|S).....\s+(\S+)/.exec(line)?.[1])
-    .filter((v): v is string => Boolean(v))
+  return parseEncoders(result.stdout)
 }

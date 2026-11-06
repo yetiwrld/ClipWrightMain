@@ -13,6 +13,10 @@ export type MediaKind = 'video' | 'audio' | 'image'
 export interface MediaProbe {
   kind: MediaKind
   durationMs: number
+  /** Duration of the audio stream alone (compare with videoDurationMs). */
+  audioDurationMs?: number
+  /** Duration of the video stream alone. */
+  videoDurationMs?: number
   width?: number
   height?: number
   fps?: number

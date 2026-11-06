@@ -147,6 +147,8 @@ export { ffmpegPath, installedModels, vault }
  * multi-megabyte log cannot stall the UI thread or blow up IPC.
  */
 export function readLogTail(lines = 400): { text: string; file: string; bytes: number } {
+  // Logging is buffered now; flush so the viewer shows what was just written.
+  log.flush()
   const dir = workspaceLayout().logs
   const file = path.join(dir, 'clipwright.log')
   if (!fs.existsSync(file)) return { text: '', file, bytes: 0 }

@@ -17,17 +17,27 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { buildScene, type SceneLayer } from '@shared/scene'
 import { effectSpeed, trackIsAudible } from '@shared/timeline-helpers'
-import { sampleTrack } from '@shared/keyframes'
+import { clampCropPair, sampleTrack } from '@shared/keyframes'
 import type { Clip, ExportPreset, Project } from '@shared/types'
 import { toFfmpegColour } from '@shared/colour'
 import { runProcess } from '../ffmpeg/runner'
 import { availableEncoders } from '../ffmpeg/probe'
+import { chooseEncoder, codecName, hardwareLabel } from './encoders'
+import { freeSpace } from '../paths'
 import { buildTextFilters } from './text-layer'
 import { computePlacement, effectChain, even, padToCanvas } from './filters'
 import { clipAnimation, hasTrack } from './animation'
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i
-const INTERMEDIATE = ['-c:v', 'qtrle', '-pix_fmt', 'argb']
+/*
+ * The intermediate must be lossless and must carry alpha (layers composite over
+ * a transparent canvas). qtrle ARGB does both but costs ~1.29 MB per 1080p frame
+ * (37 MB/s, 4.3 GB for two minutes). ffv1 in yuva420p keeps alpha for half the
+ * bytes and encodes roughly twice as fast, so it is used when available and
+ * qtrle remains the fallback.
+ */
+const INTERMEDIATE_QTRLE = ['-c:v', 'qtrle', '-pix_fmt', 'argb']
+const INTERMEDIATE_FFV1 = ['-c:v', 'ffv1', '-level', '3', '-pix_fmt', 'yuva420p', '-g', '1']
 
 export interface RenderRequest {
   project: Project
@@ -91,6 +101,16 @@ export class ProjectRenderer {
 
   /** Cached result of `ffmpeg -encoders`; the probe runs at most once per render. */
   private encoderCache: string[] | null = null
+  /** Lossless intermediate codec arguments, decided once per render. */
+  private intermediate: string[] | null = null
+
+  private async intermediateArgs(): Promise<string[]> {
+    if (this.intermediate) return this.intermediate
+    const encoders = await this.encoders()
+    this.intermediate = encoders.includes('ffv1') ? INTERMEDIATE_FFV1 : INTERMEDIATE_QTRLE
+    this.log(`intermediate: ${this.intermediate[1]}`)
+    return this.intermediate
+  }
 
   private async encoders(): Promise<string[]> {
     if (!this.encoderCache) {
@@ -133,6 +153,30 @@ export class ProjectRenderer {
     }
     fs.mkdirSync(tempDir, { recursive: true })
     onProgress?.({ stage: 'preparing', percent: 2, detail: 'Planning render' })
+    /*
+     * Disk-space preflight. The intermediate is lossless ARGB at canvas size
+     * (~1.29 MB per 1080p frame, 36.9 MB/s at 30 fps), so a ten-minute export
+     * wants ~22 GB before the deliverable is even encoded. Filling the drive
+     * mid-render used to surface as a confusing encoder error and left the
+     * segments behind; refuse up front with a number the user can act on.
+     */
+    const estimate = intermediateBytes(preset, end - start)
+    const free = freeSpace(tempDir)
+    this.log(
+      `space: need ~${(estimate / 1_073_741_824).toFixed(2)} GiB, ${(free.free / 1_073_741_824).toFixed(2)} GiB free`
+    )
+    if (free.free > 0 && free.free < estimate) {
+      return {
+        ok: false,
+        error:
+          `Not enough free disk space to render this export. It needs about ` +
+          `${(estimate / 1_073_741_824).toFixed(1)} GB for the intermediate frames but only ` +
+          `${(free.free / 1_073_741_824).toFixed(1)} GB is free where the workspace lives. ` +
+          `Export a shorter range, or free up space and try again.`,
+        warnings: this.warnings,
+        logPath: this.logPath
+      }
+    }
     const parts = segmentTimeline(project, start, end)
     this.log(`plan: ${parts.length} segments, ${((end - start) / 1000).toFixed(2)}s`)
 
@@ -173,18 +217,28 @@ export class ProjectRenderer {
      * whole export. Probe the encoder list and fall back to libx264 instead —
      * slower, always available, and the export still succeeds.
      */
+    /*
+     * Encoder choice comes from the probe: NVENC → AMF → QSV → libx264. The old
+     * code had a single hardware code path hardcoded to NVENC, so every export on
+     * an AMD or Intel machine failed and fell back to the CPU (or failed the
+     * fallback too when the probe itself was broken).
+     */
     let hardware = Boolean(this.opts.hardware)
-    if (hardware && preset.videoCodec === 'h264') {
-      const encoders = await this.encoders()
-      if (encoders.length && !encoders.includes('h264_nvenc')) {
-        hardware = false
-        this.warnings.push('No NVENC encoder on this machine — exported with the CPU (libx264) instead.')
-        this.log('hardware requested but h264_nvenc is not available; using libx264')
-      }
-    }
+    const encoders = await this.encoders()
+    let choice = chooseEncoder(preset, encoders, hardware)
+    if (choice.warning) this.warnings.push(choice.warning)
+    this.log(
+      `encoder: ${choice.encoder}${choice.hardware ? ` (hardware, ${hardwareLabel(choice.encoder as never)})` : ''}` +
+        ` from ${encoders.length} available`
+    )
+    if (!choice.hardware) hardware = false
 
     const attempt = async (useHardware: boolean) => {
-      const args = muxArgs(videoOnly, audio, this.opts.outPath, preset, useHardware)
+      const next = useHardware ? choice : chooseEncoder(preset, encoders, false)
+      const args = muxArgs(videoOnly, audio, this.opts.outPath, preset, {
+        encoder: next.encoder,
+        options: next.options
+      })
       this.log(`mux: ffmpeg ${args.join(' ')}`)
       return runProcess(this.ffmpeg, args, {
         timeoutMs: 180 * 60_000,
@@ -197,8 +251,9 @@ export class ProjectRenderer {
       // The probe can be wrong (driver present but unusable, GPU busy). Retry
       // once on the CPU rather than failing the user's export.
       hardware = false
+      choice = chooseEncoder(preset, encoders, false)
       this.warnings.push('Hardware encoding failed — retried with the CPU encoder.')
-      this.log(`hardware encode failed: ${lastLines(encoded.stderr)}; retrying with libx264`)
+      this.log(`hardware encode failed: ${lastLines(encoded.stderr)}; retrying with ${choice.encoder}`)
       onProgress?.({ stage: 'encoding', percent: 86, detail: 'Retrying with the CPU encoder' })
       encoded = await attempt(false)
     }
@@ -232,7 +287,7 @@ export class ProjectRenderer {
       '-y', '-hide_banner', '-loglevel', 'error',
       '-f', 'lavfi',
       '-i', `color=c=${colour}:s=${even(preset.width)}x${even(preset.height)}:r=${preset.fps}:d=${dur.toFixed(3)}`,
-      ...INTERMEDIATE, out
+      ...(await this.intermediateArgs()), out
     ]
     const result = await runProcess(this.ffmpeg, args, { timeoutMs: 20 * 60_000, signal: this.opts.signal })
     if (result.code !== 0) throw new Error(`Blank segment failed: ${lastLines(result.stderr)}`)
@@ -306,12 +361,15 @@ export class ProjectRenderer {
         `scale=${even(placement.contentWidth)}:${even(placement.contentHeight)}:flags=${isImage ? 'lanczos' : 'bicubic'}`
       )
       chain.push(...effectChain(layer.effects))
+      // Opposing edges are clamped as a pair: clamping each edge to 0.95 on its
+      // own allowed 190% of the frame to be cropped, which produced a negative
+      // width that Math.max(2, …) turned into a silent 2 px crop.
+      const [cropL, cropR] = clampCropPair(layer.transform.cropL, layer.transform.cropR)
+      const [cropT, cropB] = clampCropPair(layer.transform.cropT, layer.transform.cropB)
       chain.push(
-        `crop=${even(placement.contentWidth * (1 - layer.transform.cropL - layer.transform.cropR))}:${even(
-          placement.contentHeight * (1 - layer.transform.cropT - layer.transform.cropB)
-        )}:${Math.round(placement.contentWidth * layer.transform.cropL)}:${Math.round(
-          placement.contentHeight * layer.transform.cropT
-        )}`
+        `crop=${even(placement.contentWidth * (1 - cropL - cropR))}:${even(
+          placement.contentHeight * (1 - cropT - cropB)
+        )}:${Math.round(placement.contentWidth * cropL)}:${Math.round(placement.contentHeight * cropT)}`
       )
 
       // --- animated transform expressions ---
@@ -327,8 +385,8 @@ export class ProjectRenderer {
       // Cropped content is first padded into a "card" of content size so the
       // rotation pivot and overlay position stay predictable.
       const cardChain: string[] = [...chain]
-      const croppedWidth = placement.contentWidth * (1 - layer.transform.cropL - layer.transform.cropR)
-      const croppedHeight = placement.contentHeight * (1 - layer.transform.cropT - layer.transform.cropB)
+      const croppedWidth = placement.contentWidth * (1 - cropL - cropR)
+      const croppedHeight = placement.contentHeight * (1 - cropT - cropB)
       if (rotateFilter) {
         // Pad to canvas-size transparent canvas centred on the content, then rotate.
         cardChain.push(
@@ -451,16 +509,26 @@ export class ProjectRenderer {
       base = 'withtext'
     }
     graph.push(`[${base}]format=argb[out]`)
+    /*
+     * The graph goes to a file. A caption-dense timeline emits hundreds of
+     * drawtext filters; passing that as one argv string hits the Windows
+     * command-line limit (~32k characters) and the spawn itself fails with
+     * "The filename or extension is too long" — the export never even starts.
+     * `-/filter_complex <file>` makes ffmpeg read the graph from disk.
+     */
+    const graphFile = path.join(path.dirname(out), `${part.label}.filter`)
+    fs.writeFileSync(graphFile, graph.join(';'))
     const full = [
       ...args,
-      '-filter_complex', graph.join(';'),
+      '-/filter_complex', graphFile,
       '-map', '[out]',
       '-frames:v', String(Math.max(1, Math.round(segDur * preset.fps))),
-      ...INTERMEDIATE,
+      ...(await this.intermediateArgs()),
       out
     ]
     this.log(`segment ${part.label}: ${visualLayers.length} layers, ${textFilters.length} text filters`)
     this.log(`cmd: ffmpeg ${full.join(' ')}`)
+    this.log(`graph: ${graphFile} (${graph.join(';').length} chars)`)
     this.flushLog()
     const result = await runProcess(this.ffmpeg, full, {
       timeoutMs: 90 * 60_000,
@@ -494,7 +562,16 @@ export class ProjectRenderer {
   ): Promise<string | null> {
     const wav = path.join(tempDir, 'mix.wav')
     const dur = ((range.end - range.start) / 1000).toFixed(3)
-    const args = buildAudioRenderArgs(project, range, wav)
+    const missingAudio: string[] = []
+    const args = buildAudioRenderArgs(project, range, wav, missingAudio)
+    if (missingAudio.length) {
+      const unique = [...new Set(missingAudio)]
+      this.warnings.push(
+        `Audio was skipped for ${unique.length} missing media file${unique.length > 1 ? 's' : ''}: ${unique
+          .slice(0, 3)
+          .join(', ')}. Relink ${unique.length > 1 ? 'them' : 'it'} and export again.`
+      )
+    }
     if (!args) {
       const silent = await runProcess(
         this.ffmpeg,
@@ -549,7 +626,9 @@ function transitionSteps(project: Project, clip: Clip, part: Part, segDur: numbe
 export function buildAudioRenderArgs(
   project: Project,
   range: { start: number; end: number },
-  outWav: string
+  outWav: string,
+  /** Filled with the names of assets that are gone, so the caller can warn. */
+  missing: string[] = []
 ): string[] | null {
   const picks: { clip: Clip; path: string }[] = []
   for (const clip of project.clips) {
@@ -559,7 +638,13 @@ export function buildAudioRenderArgs(
     if (clip.audio.muted || clip.audio.volume <= 0) continue
     if (clip.start + clip.duration <= range.start || clip.start >= range.end) continue
     const asset = project.assets.find((a) => a.id === clip.assetId)
-    if (!asset || !fs.existsSync(asset.path)) continue
+    if (!asset) continue
+    if (!fs.existsSync(asset.path)) {
+      // Silence used to be the only symptom: the export "succeeded" with no
+      // audio and no hint which file was gone.
+      missing.push(asset.name)
+      continue
+    }
     if (asset.kind === 'image') continue
     const hasAudio = asset.probe.hasAudio || asset.kind === 'audio'
     if (!hasAudio) continue
@@ -591,8 +676,34 @@ export function buildAudioRenderArgs(
       remaining /= 0.5
     }
     if (Math.abs(remaining - 1) > 0.001) chain.push(`atempo=${remaining.toFixed(4)}`)
-    const gain = clip.audio.volume * Math.pow(10, clip.audio.gainDb / 20)
-    if (Math.abs(gain - 1) > 0.001) chain.push(`volume=${gain.toFixed(4)}`)
+    /*
+     * `volume` is an animatable property and the preview samples its keyframe
+     * track, but the export read only the static value — so volume animation
+     * played in the preview and vanished from the file. Sample the track at the
+     * ends of the overlap and bake a linear `volume` expression (ffmpeg's volume
+     * filter evaluates `t` per frame) when the two differ.
+     */
+    const baseGain = clip.audio.volume * Math.pow(10, clip.audio.gainDb / 20)
+    const volumeTrack = clip.keyframes?.volume ?? []
+    const localStart = clip.sourceIn / speed + skip
+    const localEnd = localStart + (overlapEnd - overlapStart)
+    const startLevel = volumeTrack.length ? sampleTrack(volumeTrack, localStart) : null
+    const endLevel = volumeTrack.length ? sampleTrack(volumeTrack, localEnd) : null
+    if (
+      volumeTrack.length > 1 &&
+      startLevel !== null &&
+      endLevel !== null &&
+      Math.abs(startLevel - endLevel) > 0.005
+    ) {
+      const from = startLevel * Math.pow(10, clip.audio.gainDb / 20)
+      const to = endLevel * Math.pow(10, clip.audio.gainDb / 20)
+      const duration = Math.max(0.001, durSec)
+      const slope = (to - from) / duration
+      chain.push(`volume='${Math.max(0, from).toFixed(4)}+${slope.toFixed(5)}*t':eval=frame`)
+    } else {
+      const gain = baseGain
+      if (Math.abs(gain - 1) > 0.001) chain.push(`volume=${gain.toFixed(4)}`)
+    }
     if (clip.audio.normalize) chain.push('dynaudnorm=f=250:g=15')
     if (clip.audio.bass) chain.push(`bass=g=${clip.audio.bass.toFixed(1)}`)
     if (clip.audio.treble) chain.push(`treble=g=${clip.audio.treble.toFixed(1)}`)
@@ -627,25 +738,32 @@ export function muxArgs(
   audioFile: string | null,
   outPath: string,
   preset: ExportPreset,
-  hardware?: boolean
+  encoding?: boolean | { encoder: string; options: string[] }
 ): string[] {
-  const useNvenc = Boolean(hardware) && preset.videoCodec === 'h264'
+  /*
+   * `true`/`false` is the legacy shape (hardware on/off, NVENC assumed); the
+   * object form carries the encoder the probe selected plus its own option set.
+   * Keeping both means old callers and tests still mean what they said.
+   */
+  const explicit = typeof encoding === 'object' ? encoding : undefined
+  const encoder = explicit?.encoder ?? (encoding === true ? 'h264_nvenc' : codecName(preset.videoCodec))
+  const options =
+    explicit?.options ??
+    (encoding === true
+      ? ['-preset', 'p5', '-rc', 'vbr', '-cq', '21', '-b:v', `${preset.videoBitrateKbps}k`]
+      : ['-preset', preset.speed, '-crf', '19', '-b:v', `${preset.videoBitrateKbps}k`])
   const args: string[] = ['-y', '-hide_banner', '-loglevel', 'warning', '-nostdin', '-i', videoFile]
   if (audioFile) args.push('-i', audioFile)
   args.push('-map', '0:v:0')
   if (audioFile) args.push('-map', '1:a:0')
-  args.push(
-    '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p',
-    '-r', String(preset.fps),
-    '-c:v', useNvenc ? 'h264_nvenc' : codecName(preset.videoCodec)
-  )
-  if (useNvenc) args.push('-preset', 'p5', '-rc', 'vbr', '-cq', '21', '-b:v', `${preset.videoBitrateKbps}k`)
-  else args.push('-preset', preset.speed, '-crf', '19', '-b:v', `${preset.videoBitrateKbps}k`)
-  args.push(
-    '-maxrate', `${Math.round(preset.videoBitrateKbps * 1.5)}k`,
-    '-bufsize', `${preset.videoBitrateKbps * 2}k`,
-    '-pix_fmt', 'yuv420p'
-  )
+  /*
+   * No `scale=trunc(iw/2)*2:...` here: the intermediate is already rendered at
+   * the export size (even-rounded at segment time), so rescaling it on the mux
+   * was a full extra resample and a slight softening for nothing.
+   */
+  args.push('-vf', 'format=yuv420p', '-r', String(preset.fps), '-c:v', encoder)
+  args.push(...options)
+  args.push('-pix_fmt', 'yuv420p')
   if (audioFile) {
     args.push(
       '-c:a', preset.audioCodec === 'opus' ? 'libopus' : 'aac',
@@ -657,17 +775,18 @@ export function muxArgs(
   return args
 }
 
-function codecName(codec: ExportPreset['videoCodec']): string {
-  switch (codec) {
-    case 'hevc':
-      return 'libx265'
-    case 'vp9':
-      return 'libvpx-vp9'
-    case 'av1':
-      return 'libsvtav1'
-    default:
-      return 'libx264'
-  }
+/**
+ * Bytes the lossless intermediate will occupy: ARGB at canvas size for every
+ * frame of the range, plus the joined copy. Deliberately generous — running out
+ * of space mid-render is far worse than refusing a little early.
+ */
+export function intermediateBytes(
+  preset: { width: number; height: number; fps: number },
+  durationMs: number
+): number {
+  const frames = Math.max(1, Math.ceil((durationMs / 1000) * preset.fps))
+  const perFrame = preset.width * preset.height * 4
+  // Segments + the concatenated copy, plus a little slack for the WAV and log.
+  return Math.round(frames * perFrame * 1.15 + 64 * 1024 * 1024)
 }
-
 export { hasTrack, sampleTrack }

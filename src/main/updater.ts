@@ -267,9 +267,23 @@ async function fetchExpectedDigest(info: UpdateInfo): Promise<string | null> {
   }
 }
 
-/** Launch the verified installer. The app quits so files can be replaced. */
+/**
+ * Launch the verified installer. The app quits so files can be replaced.
+ *
+ * The renderer supplies the path, and this function used to trust it and hand it
+ * to the OS — i.e. a compromised renderer could launch any executable. Only a
+ * file inside the updater's own download folder is accepted, which is where
+ * downloadUpdate() writes after the checksum matched.
+ */
 export function installUpdate(installerPath: string): { launched: boolean; error?: string } {
   if (!fs.existsSync(installerPath)) return { launched: false, error: 'The installer file is missing.' }
+  if (!isUpdaterInstaller(installerPath)) {
+    log.warn('update', `refused to install a file outside the update folder: ${String(installerPath).slice(0, 200)}`)
+    return {
+      launched: false,
+      error: 'That file was not downloaded by the updater, so it will not be run. Use Settings → Updates.'
+    }
+  }
   try {
     const child = shell.openPath(installerPath)
     void child
@@ -279,6 +293,29 @@ export function installUpdate(installerPath: string): { launched: boolean; error
   } catch (error) {
     return { launched: false, error: error instanceof Error ? error.message : String(error) }
   }
+}
+
+/** Is this the file the updater downloaded into its own folder? */
+export function isUpdaterInstaller(installerPath: string): boolean {
+  if (typeof installerPath !== 'string' || !installerPath.trim()) return false
+  if (!/\.exe$/i.test(installerPath)) return false
+  let dir: string
+  let real: string
+  try {
+    dir = fs.realpathSync(path.join(workspaceLayout().cache, 'updates'))
+  } catch {
+    return false
+  }
+  try {
+    real = fs.realpathSync(installerPath)
+  } catch {
+    return false
+  }
+  const normalise = (value: string) =>
+    (process.platform === 'win32' ? value.toLowerCase() : value).replace(/\\/g, '/')
+  const target = normalise(real)
+  const base = normalise(dir)
+  return target.startsWith(`${base}/`) && path.dirname(real) === dir
 }
 
 export function openReleasePage(url: string): void {

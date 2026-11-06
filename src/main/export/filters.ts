@@ -9,28 +9,38 @@ import type { Effect } from '@shared/types'
 /** Build the effect chain for a clip (colour + blur + vignette, in filter order). */
 export function effectChain(effects: Effect[]): string[] {
   const chain: string[] = []
-  const get = (type: string) => effects.find((e) => e.type === type && e.enabled)
+  /*
+   * `find()` silently dropped every duplicate: two blur effects meant only the
+   * first existed. Effects of the same type now stack (their values are summed,
+   * which is what a user means by adding brightness twice).
+   */
+  const sum = (type: string) =>
+    effects
+      .filter((e) => e.type === type && e.enabled)
+      .reduce((total, e) => total + (Number.isFinite(e.value) ? e.value : 0), 0)
+  const has = (type: string) => effects.some((e) => e.type === type && e.enabled)
   const eqParts: string[] = []
-  const brightness = get('brightness')
-  const contrast = get('contrast')
-  const saturation = get('saturation')
-  const exposure = get('exposure')
-  if (brightness) eqParts.push(`brightness=${(brightness.value * 0.5).toFixed(3)}`)
-  if (contrast) eqParts.push(`contrast=${contrast.value.toFixed(3)}`)
-  if (saturation) eqParts.push(`saturation=${saturation.value.toFixed(3)}`)
-  if (exposure) {
+  if (has('brightness') || has('exposure')) {
+    /*
+     * brightness and exposure both map onto eq's brightness plane. Emitting two
+     * `brightness=` options in one eq filter is invalid — ffmpeg keeps the last
+     * and drops the first — so they are combined into one value.
+     */
+    const fromBrightness = sum('brightness') * 0.5
     // Exposure expressed in stops -> multiply by 2^stops.
-    const factor = Math.pow(2, exposure.value)
-    eqParts.push(`brightness=${((factor - 1) * 0.35).toFixed(3)}`)
+    const fromExposure = (Math.pow(2, sum('exposure')) - 1) * 0.35
+    eqParts.push(`brightness=${(fromBrightness + fromExposure).toFixed(3)}`)
   }
+  if (has('contrast')) eqParts.push(`contrast=${sum('contrast').toFixed(3)}`)
+  if (has('saturation')) eqParts.push(`saturation=${sum('saturation').toFixed(3)}`)
   if (eqParts.length) chain.push(`eq=${eqParts.join(':')}`)
 
-  const temperature = get('temperature')
-  const tint = get('tint')
+  const temperature = has('temperature') ? sum('temperature') : 0
+  const tint = has('tint') ? sum('tint') : 0
   if (temperature || tint) {
     // Warm/cool shift via per-channel balance; tint shifts green/magenta.
-    const warmth = temperature?.value ?? 0
-    const tintValue = tint?.value ?? 0
+    const warmth = temperature
+    const tintValue = tint
     const r = 1 + warmth * 0.22 + tintValue * 0.06
     const g = 1 - Math.abs(warmth) * 0.04 - tintValue * 0.12
     const b = 1 - warmth * 0.2 + tintValue * 0.06
@@ -43,23 +53,23 @@ export function effectChain(effects: Effect[]): string[] {
     )
   }
 
-  const sharpen = get('sharpen')
-  if (sharpen && sharpen.value > 0.01) {
-    const amount = Math.min(1.5, sharpen.value * 0.75)
+  const sharpenValue = sum('sharpen')
+  if (sharpenValue > 0.01) {
+    const amount = Math.min(1.5, sharpenValue * 0.75)
     chain.push(`unsharp=5:5:${amount.toFixed(2)}:5:5:0`)
   }
 
-  const blur = get('blur')
-  if (blur && blur.value > 0.05) {
-    const sigma = Math.min(20, blur.value)
+  const blurValue = sum('blur')
+  if (blurValue > 0.05) {
+    const sigma = Math.min(20, blurValue)
     // boxblur radius must be > 0 and scale with the requested sigma.
     const radius = Math.max(1, Math.round(sigma / 2))
     chain.push(`gblur=sigma=${sigma.toFixed(2)}:steps=${Math.min(6, Math.max(2, radius / 2)).toFixed(0)}`)
   }
 
-  const vignette = get('vignette')
-  if (vignette && vignette.value > 0.01) {
-    chain.push(`vignette=angle=${(vignette.value * 1.2).toFixed(3)}`)
+  const vignetteValue = sum('vignette')
+  if (vignetteValue > 0.01) {
+    chain.push(`vignette=angle=${(Math.min(1, vignetteValue) * 1.2).toFixed(3)}`)
   }
   return chain
 }
@@ -96,8 +106,13 @@ export function placeFilter(spec: PlaceSpec, rotationExpr?: string): string {
   if (Math.abs(spec.rotation) > 0.01) {
     parts.push(`rotate=${rotationExpr ? `a=${rotationExpr}` : (spec.rotation * Math.PI) / 180}:c=none`)
   }
-  parts.push(...padToCanvas(spec.width, spec.height, cw, ch, spec.x, spec.y))
+  // `format=rgba` first: pad has no alpha plane to carry, so `color=black@0`
+  // against an RGB frame produced an OPAQUE black border (measured 0,0,0,255).
+  // Converting before the pad keeps the surround transparent (0,0,0,0), which is
+  // what makes contain-fit, offset and scaled-down overlays composite instead of
+  // painting a black rectangle over everything under them.
   parts.push(`format=rgba`)
+  parts.push(...padToCanvas(spec.width, spec.height, cw, ch, spec.x, spec.y))
   if (spec.opacity < 0.999) parts.push(`colorchannelmixer=aa=${spec.opacity.toFixed(3)}`)
   return parts.join(',')
 }
@@ -184,7 +199,10 @@ export function xfadeName(type: string): string {
     case 'fadeToBlack':
       return 'fadeblack'
     case 'fadeFromBlack':
-      return 'fadeblack'
+      // The incoming clip fades up out of black, which is a plain xfade `fade`
+      // (the black frame is the outgoing one). Mapping it to `fadeblack`, as this
+      // used to, made the two "black" presets render identically.
+      return 'fade'
     case 'wipeLeft':
       return 'wipeleft'
     case 'wipeRight':
@@ -196,7 +214,10 @@ export function xfadeName(type: string): string {
     case 'zoomIn':
       return 'zoomin'
     case 'zoomOut':
-      return 'smoothleft'
+      // xfade has zoomin but no zoomout; circleclose is the real "pull away"
+      // transition. (This used to be smoothleft — i.e. a sideways swipe that had
+      // nothing to do with the preset the user picked.)
+      return 'circleclose'
     default:
       return 'fade'
   }

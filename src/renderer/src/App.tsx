@@ -1,5 +1,5 @@
 /** Application shell: routing, layout, menu commands, shortcuts, toasts. */
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useState } from 'react'
 import clsx from 'clsx'
 import {
   Captions,
@@ -32,13 +32,33 @@ import { Timeline } from './components/Timeline'
 import { MediaLibrary } from './components/MediaLibrary'
 import { Inspector } from './components/Inspector'
 import { TextLibrary } from './components/TextLibrary'
+
+
+
+
+
 import { HomeScreen } from './screens/HomeScreen'
-import { ClipsWorkspace } from './screens/ClipsWorkspace'
-import { CaptionsStudio } from './screens/CaptionsStudio'
-import { ExportPanel } from './screens/ExportPanel'
-import { SettingsScreen } from './screens/SettingsScreen'
 import { Onboarding } from './screens/Onboarding'
-import { ImportWizard } from './screens/ImportWizard'
+
+/*
+ * The workspace screens are split out of the entry chunk. Everything used to
+ * ship as one 1.1 MB renderer bundle, so the first paint waited for the clip
+ * scanner, the caption studio and the export panel even though at most one is
+ * shown. The launch screen (Home) stays eager: it is what the window shows first,
+ * and a suspense flash there would be a worse first impression than the bytes.
+ */
+const ClipsWorkspace = lazy(() =>
+  import('./screens/ClipsWorkspace').then((m) => ({ default: m.ClipsWorkspace }))
+)
+const CaptionsStudio = lazy(() =>
+  import('./screens/CaptionsStudio').then((m) => ({ default: m.CaptionsStudio }))
+)
+const ExportPanel = lazy(() => import('./screens/ExportPanel').then((m) => ({ default: m.ExportPanel })))
+const SettingsScreen = lazy(() =>
+  import('./screens/SettingsScreen').then((m) => ({ default: m.SettingsScreen }))
+)
+const ImportWizard = lazy(() => import('./screens/ImportWizard').then((m) => ({ default: m.ImportWizard })))
+
 import { api, errorMessage } from './lib/api'
 import { formatClock } from '@shared/time'
 import { baseClip, overwriteClip } from '@shared/timeline'
@@ -440,6 +460,7 @@ export default function App(): JSX.Element {
       )}
 
       <main className="app__main">
+        <Suspense fallback={<div className="screen-wrap" aria-busy="true" />}>
         {screen === 'home' && <HomeScreen onOpen={(id) => void open(id)} />}
 
         {screen === 'clips' && (
@@ -469,6 +490,7 @@ export default function App(): JSX.Element {
             <SettingsScreen />
           </div>
         )}
+        </Suspense>
 
         {screen === 'editor' && project && (
           <div className="editor">
@@ -520,6 +542,7 @@ export default function App(): JSX.Element {
         onCaptions={() => setScreen('captions')}
       />
 
+      <Suspense fallback={null}>
       <ImportWizard
         open={importOpen}
         urlMode={importUrlMode}
@@ -532,6 +555,7 @@ export default function App(): JSX.Element {
       />
 
       <ExportPanel open={exportOpen} onClose={() => setExportOpen(false)} />
+      </Suspense>
 
       <Modal open={helpOpen} onClose={() => setHelpOpen(false)} title="Keyboard shortcuts" size="wide">
         <div className="shortcut-grid">

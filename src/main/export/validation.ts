@@ -39,8 +39,10 @@ export async function validateExport(file: string, preset: ExportPreset, opts: V
   let fps: number | undefined
   let durationMs: number | undefined
   let hasAudio = false
+  let probed: Awaited<ReturnType<typeof probeMedia>> | undefined
   try {
     const probe = await probeMedia(file)
+    probed = probe
     width = probe.width
     height = probe.height
     fps = probe.fps
@@ -59,9 +61,14 @@ export async function validateExport(file: string, preset: ExportPreset, opts: V
   if (fps && Math.abs(fps - opts.expected.fps) > 0.6) {
     problems.push(`Frame rate is ${fps} but ${opts.expected.fps} was requested.`)
   }
-  const aspectOk =
-    Boolean(width && height) &&
-    Math.abs(width! / height! - opts.expected.width / opts.expected.height) < 0.02
+  /*
+   * Compare the output to the *requested aspect*, not to the requested
+   * width/height — those are the same numbers the output was rendered at, which
+   * made this check a tautology that could only fire after the width check had
+   * already failed.
+   */
+  const wanted = aspectRatio(opts.expected.aspect) ?? opts.expected.width / opts.expected.height
+  const aspectOk = Boolean(width && height) && Math.abs(width! / height! - wanted) < 0.03
   if (!aspectOk) problems.push('The output aspect ratio does not match the project.')
   if (opts.requireAudio && !hasAudio) problems.push('The output has no audio stream.')
 
@@ -91,20 +98,30 @@ export async function validateExport(file: string, preset: ExportPreset, opts: V
     ['-hide_banner', '-loglevel', 'info', '-i', file, '-vf', 'blackdetect=d=0.2:pix_th=0.08', '-an', '-f', 'null', '-'],
     { timeoutMs: 30 * 60_000 }
   )
-  const blackLines = (black.stderr.match(/black_start/g) ?? []).length
-  if (durationMs) {
-    // Each detection spans at least 0.2s.
-    blackFrameRatio = Math.min(1, (blackLines * 0.2) / (durationMs / 1000))
-    if (blackLines > 0 && blackFrameRatio > 0.6) {
+  const blackSeconds = blackDurationSeconds(black.stderr)
+  if (durationMs && durationMs > 0) {
+    /*
+     * blackdetect reports one `black_start` per continuous black *run*, not one
+     * per 0.2 s, so multiplying the count by 0.2 produced a number with no unit
+     * meaning: three one-second runs in a 60 s export computed 1%, and the
+     * ">60% black" alarm could never fire. Sum the spans instead.
+     */
+    blackFrameRatio = Math.min(1, blackSeconds / (durationMs / 1000))
+    if (blackFrameRatio > 0.6) {
       problems.push('More than 60% of the output is black — check that the timeline has visible clips.')
     }
   }
 
-  // Audio/video duration consistency (sync sanity check).
+  /*
+   * Audio/video duration consistency comes from the probe that already ran.
+   * `streamDuration()` used to decode the whole file twice more (once per
+   * stream) purely to read two durations — two extra realtime-cost passes on
+   * every export.
+   */
   let audioVideoDeltaMs: number | undefined
-  if (hasAudio) {
-    const audioDur = await streamDuration(file, 'a')
-    const videoDur = await streamDuration(file, 'v')
+  if (hasAudio && probed) {
+    const audioDur = probed.audioDurationMs
+    const videoDur = probed.videoDurationMs
     if (audioDur && videoDur) audioVideoDeltaMs = Math.abs(audioDur - videoDur)
     if (audioVideoDeltaMs !== undefined && audioVideoDeltaMs > 1200) {
       problems.push(
@@ -132,19 +149,27 @@ export async function validateExport(file: string, preset: ExportPreset, opts: V
   }
 }
 
-/** Decode a single stream to null and read its reported duration. */
-async function streamDuration(file: string, kind: 'a' | 'v'): Promise<number | undefined> {
-  const result = await runProcess(
-    ffmpegPath(),
-    ['-hide_banner', '-i', file, '-map', `0:${kind}:0`, '-f', 'null', '-'],
-    { timeoutMs: 20 * 60_000 }
-  )
-  const match = /time=(\d+):(\d+):(\d+\.?\d*)/g
-  let last: RegExpExecArray | null = null
-  let m: RegExpExecArray | null
-  while ((m = match.exec(result.stderr)) !== null) last = m
-  if (!last) return undefined
-  return (
-    (Number(last[1]) * 3600 + Number(last[2]) * 60 + Number(last[3])) * 1000
-  )
+/** Sum every blackdetect run, in seconds. */
+export function blackDurationSeconds(stderr: string): number {
+  let total = 0
+  const starts = [...stderr.matchAll(/black_start:\s*([0-9.]+)/g)].map((m) => Number(m[1]))
+  const ends = [...stderr.matchAll(/black_end:\s*([0-9.]+)/g)].map((m) => Number(m[1]))
+  for (let i = 0; i < starts.length; i++) {
+    const start = starts[i]
+    const end = ends[i]
+    if (end !== undefined && end > start) total += end - start
+    else if (end === undefined) total += 0.2 // run still open at EOF
+  }
+  return total
+}
+
+/** "16:9" → 16/9. Returns undefined for anything that is not w:h. */
+export function aspectRatio(aspect: string | undefined): number | undefined {
+  if (!aspect) return undefined
+  const match = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(aspect.trim())
+  if (!match) return undefined
+  const w = Number(match[1])
+  const h = Number(match[2])
+  if (!w || !h) return undefined
+  return w / h
 }

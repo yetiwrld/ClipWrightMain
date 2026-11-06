@@ -69,9 +69,29 @@ export function resolveClipProps(
 export function clampProp(prop: AnimatableProp, value: number): number {
   if (prop === 'opacity' || prop === 'volume') return Math.min(1, Math.max(0, value))
   if (prop === 'cropL' || prop === 'cropR' || prop === 'cropT' || prop === 'cropB') {
-    return Math.min(0.95, Math.max(0, value))
+    return Math.min(MAX_EDGE_CROP, Math.max(0, value))
   }
   return value
+}
+
+/**
+ * Largest crop a single edge may take.
+ *
+ * Each edge is clamped on its own, so left+right could reach 1.9 of the frame;
+ * the renderer then computed contentWidth * (1 - l - r) — a negative width that
+ * Math.max(2, …) silently turned into a 2 px crop. Opposing edges are clamped as
+ * a pair so at least a sliver of picture always survives.
+ */
+export const MAX_EDGE_CROP = 0.95
+
+/** Clamp opposing crop edges so left+right (and top+bottom) stay below 100%. */
+export function clampCropPair(a: number, b: number, max = 0.98): [number, number] {
+  const left = Math.min(MAX_EDGE_CROP, Math.max(0, a))
+  const right = Math.min(MAX_EDGE_CROP, Math.max(0, b))
+  const total = left + right
+  if (total <= max) return [left, right]
+  const scale = max / total
+  return [left * scale, right * scale]
 }
 
 export function addKeyframe(
