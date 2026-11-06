@@ -101,7 +101,8 @@ jobs:
           gh api -X POST "repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA/comments" -F body=@smoke-body.md
           exit 1
 
-  # Runs when a commit asks for it (`[package]` in the message) or by hand.
+  # Runs when a commit asks for it (`[package]` for a pre-release, `[release]`
+  # for a stable version) or by hand.
   # Once this branch is merged, `release.yml` becomes the canonical build
   # (tag-driven, publishes a GitHub Release); GitHub only registers workflows
   # that exist on the default branch, so the packaging steps live here too until
@@ -110,7 +111,10 @@ jobs:
     name: Package installer & portable
     if: >-
       (github.event_name == 'workflow_dispatch' && inputs.package) ||
-      (github.event_name == 'push' && contains(github.event.head_commit.message, '[package]'))
+      (github.event_name == 'push' && (
+        contains(github.event.head_commit.message, '[package]') ||
+        contains(github.event.head_commit.message, '[release]')
+      ))
     needs: verify
     runs-on: windows-latest
     steps:
