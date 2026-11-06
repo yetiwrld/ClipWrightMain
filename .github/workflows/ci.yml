@@ -8,6 +8,11 @@ on:
       - 'dependabot/**'
   pull_request:
   workflow_dispatch:
+    inputs:
+      package:
+        description: 'Also build the Windows installer and portable exe'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -43,3 +48,84 @@ jobs:
 
       - name: Export a real video from the build
         run: node scripts/smoke-render.mjs --resources . --out ${{ runner.temp }}/clipwright-smoke.mp4
+
+  # Manual only. Once this branch is merged, `release.yml` becomes the canonical
+  # build (tag-driven, publishes a GitHub Release); GitHub only registers
+  # workflows that exist on the default branch, so the packaging steps live here
+  # too until then.
+  package:
+    name: Package installer & portable (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.package
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch ffmpeg + whisper.cpp binaries
+        run: node scripts/fetch-binaries.mjs
+
+      - name: Generate icons from the logo
+        run: node scripts/make-icons.mjs
+
+      - name: Build
+        run: npm run build
+
+      - name: Package (NSIS installer + portable exe)
+        run: npx electron-builder --win --x64 --publish never --config electron-builder.config.cjs
+
+      - name: Verify assembly (asar + binaries + fonts)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'release/win-unpacked/resources/app.asar')) { throw 'app.asar is missing' }
+          $listing = npx asar list release/win-unpacked/resources/app.asar
+          foreach ($required in @('out\main\index.js', 'out\preload\index.js', 'out\renderer\index.html')) {
+            if (-not ($listing -match [regex]::Escape($required))) { throw "$required is not inside app.asar" }
+          }
+          if (-not ($listing -match 'node_modules\\fflate')) { throw 'fflate was not packaged' }
+          foreach ($exe in @('ffmpeg.exe', 'ffprobe.exe')) {
+            $path = "release/win-unpacked/resources/ffmpeg/$exe"
+            if (-not (Test-Path $path)) { throw "$exe was not bundled" }
+            & $path -hide_banner -version | Select-Object -First 1
+          }
+          Write-Host "$((Get-ChildItem release/win-unpacked/resources/fonts -Filter *.ttf).Count) bundled fonts"
+
+      - name: Smoke-test the packaged app (boot + real export)
+        shell: pwsh
+        run: |
+          $env:CLIPWRIGHT_SMOKE = '1'
+          $proc = Start-Process -FilePath 'release/win-unpacked/Clipwright Studio.exe' -PassThru
+          if (-not $proc.WaitForExit(120000)) { $proc.Kill(); throw 'the packaged app never finished loading' }
+          $proc.Refresh()
+          $code = $proc.ExitCode
+          Remove-Item Env:\CLIPWRIGHT_SMOKE
+          Get-Process | Where-Object { $_.ProcessName -like '*Clipwright*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+          if ($code -ne 0) { throw "packaged app failed to boot (exit code $code)" }
+          Write-Host 'packaged app booted'
+          node scripts/smoke-render.mjs --resources release/win-unpacked/resources --out $env:RUNNER_TEMP/smoke.mp4
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem release -File | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}} | Format-Table -AutoSize
+          $files = Get-ChildItem release -File | Where-Object { $_.Extension -in '.exe','.blockmap','.yml' }
+          $files | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content release/checksums.txt
+          Get-Content release/checksums.txt
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipwright-windows-x64
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/*.yml
+            release/checksums.txt
+          if-no-files-found: error
