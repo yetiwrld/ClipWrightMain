@@ -1,0 +1,50 @@
+{
+  "name": "clipwright-studio",
+  "productName": "Clipwright Studio",
+  "version": "1.0.6",
+  "description": "AI-powered video clipping and professional multitrack video editor for Windows",
+  "main": "./out/main/index.js",
+  "author": {
+    "name": "Clipwright Studio",
+    "email": "clipwright@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/yetiwrld/ClipWrightMain",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "npm run typecheck && npm test",
+    "icons": "node scripts/make-icons.mjs",
+    "fetch:binaries": "node scripts/fetch-binaries.mjs",
+    "dist:win": "npm run build && electron-builder --win --x64 --publish never --config electron-builder.config.cjs",
+    "dist:portable": "npm run build && electron-builder --win portable --x64 --publish never --config electron-builder.config.cjs",
+    "dist:dir": "npm run build && electron-builder --win --dir --x64 --config electron-builder.config.cjs",
+    "publish:win": "npm run build && electron-builder --win --x64 --publish always --config electron-builder.config.cjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "clsx": "^2.1.1",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "jsdom": "^25.0.1",
+    "lucide-react": "^0.454.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.9.3",
+    "vite": "^5.4.21",
+    "vitest": "^2.1.9",
+    "zustand": "^4.5.7"
+  }
+}

@@ -1,0 +1,249 @@
+/* ==========================================================================
+   Clipwright Studio — design tokens
+   Derived from the supplied logo: vivid orange brand, amber accent, charcoal
+   field, metallic grey neutrals. Dark is the default; light is fully supported
+   through the same variables (no component rebuilds required).
+   ========================================================================== */
+
+:root {
+  /* ---- brand ---- */
+  --brand: #ff7a18;
+  --brand-hover: #ff8c39;
+  --brand-pressed: #e86a0d;
+  --brand-soft: rgba(255, 122, 24, 0.14);
+  --brand-soft-strong: rgba(255, 122, 24, 0.24);
+  --brand-contrast: #1a0d02;
+  --accent: #ffc24b;
+  --accent-soft: rgba(255, 194, 75, 0.16);
+  --brand-gradient: linear-gradient(135deg, #ff7a18 0%, #ffa53d 55%, #ffc24b 100%);
+
+  /* ---- surfaces ---- */
+  --bg: #0b0b0d;
+  --bg-alt: #0e0e11;
+  --surface: #131316;
+  --surface-2: #17171b;
+  --surface-3: #1c1c21;
+  --surface-elevated: #202027;
+  --sidebar: #0d0d10;
+  --toolbar: #121215;
+  --overlay: rgba(4, 4, 6, 0.72);
+
+  /* ---- text ---- */
+  --text: #f4f4f6;
+  --text-secondary: #b3b3bd;
+  --text-muted: #7c7c88;
+  --text-faint: #55555f;
+  --text-on-brand: #180b01;
+
+  /* ---- lines ---- */
+  --border: #24242b;
+  --border-strong: #32323b;
+  --border-subtle: #1a1a1f;
+  --separator: #202027;
+
+  /* ---- states ---- */
+  --success: #3fbf87;
+  --success-soft: rgba(63, 191, 135, 0.14);
+  --warning: #f2b53d;
+  --warning-soft: rgba(242, 181, 61, 0.14);
+  --danger: #f0616d;
+  --danger-soft: rgba(240, 97, 109, 0.14);
+  --info: #5aa9e6;
+  --info-soft: rgba(90, 169, 230, 0.14);
+
+  /* ---- timeline ---- */
+  --tl-bg: #0a0a0c;
+  --tl-ruler: #121216;
+  --tl-grid: #1b1b21;
+  --tl-grid-strong: #2a2a33;
+  --tl-track: #121218;
+  --tl-track-alt: #14141a;
+  --tl-track-locked: #0f0f13;
+  --clip-video: #2b4d6b;
+  --clip-video-edge: #3d6c92;
+  --clip-audio: #2f6b52;
+  --clip-audio-edge: #3f8c6b;
+  --clip-image: #5a4a74;
+  --clip-image-edge: #7a64a0;
+  --clip-text: #6b5228;
+  --clip-text-edge: #94702f;
+  --clip-caption: #6b3f2a;
+  --clip-caption-edge: #93573a;
+  --clip-selected: var(--brand);
+  --playhead: #ff5a3c;
+  --playhead-glow: rgba(255, 90, 60, 0.35);
+  --snap-guide: var(--accent);
+  --selection-box: rgba(255, 122, 24, 0.14);
+
+  /* ---- spacing scale (4px base) ---- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 40px;
+  --sp-9: 48px;
+  --sp-10: 64px;
+
+  /* ---- radii ----
+     Slightly rounder than before on request, but still a desktop tool: panels
+     and cards get the largest values, controls stay tighter so dense rows do
+     not turn into pills. */
+  --r-xs: 4px;
+  --r-sm: 7px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-xl: 18px;
+  --r-pill: 999px;
+
+  /* ---- typography ---- */
+  --font-ui: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+  --font-display: 'Inter', 'Segoe UI Variable', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace;
+
+  --fs-micro: 10.5px;
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-base: 13.5px;
+  --fs-md: 15px;
+  --fs-lg: 18px;
+  --fs-xl: 22px;
+  --fs-2xl: 28px;
+  --fs-3xl: 34px;
+
+  --lh-tight: 1.2;
+  --lh-base: 1.45;
+  --lh-relaxed: 1.6;
+  --tracking-wide: 0.06em;
+
+  /* ---- elevation ---- */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 8px 20px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 18px 44px rgba(0, 0, 0, 0.5);
+  --shadow-brand: 0 4px 16px rgba(255, 122, 24, 0.28);
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--brand);
+
+  /* ---- motion ---- */
+  --dur-fast: 90ms;
+  --dur-pop: 180ms;
+  --dur-base: 150ms;
+  --dur-slow: 240ms;
+  --ease: cubic-bezier(0.2, 0, 0.15, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* ---- layout ---- */
+  --titlebar-h: 40px;
+  --rail-w: 74px;
+  --panel-header-h: 38px;
+  --control-h: 30px;
+  --control-h-sm: 26px;
+  --z-modal: 1000;
+  --z-toast: 1200;
+  --z-context: 1100;
+
+  /* ---- interactive surfaces ---- */
+  --surface-hover: rgba(255, 255, 255, 0.045);
+  --surface-active: rgba(255, 255, 255, 0.075);
+
+  /* ---- legacy aliases ----------------------------------------------------
+     screens.css and components.css were written against an earlier naming
+     scheme. These aliases keep those ~85 declarations valid; the canonical
+     names above are what new rules should use. Without them `height`,
+     `background` and `color` declarations referencing them are dropped by the
+     CSS parser, which is what made the toolbar collapse and panels go
+     transparent. References resolve at use time, so they follow the theme. */
+  --toolbar-height: var(--titlebar-h);
+  --bg-elevated: var(--surface-elevated);
+  --text-primary: var(--text);
+  --text-tertiary: var(--text-muted);
+  --radius-xs: var(--r-xs);
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+  --motion-fast: var(--dur-fast);
+  --track: var(--border);
+  --fill: var(--brand);
+}
+
+/* Light theme: same token names, re-tuned values. */
+:root[data-theme='light'] {
+  --bg: #f4f5f7;
+  --bg-alt: #eceef1;
+  --surface: #ffffff;
+  --surface-2: #f7f8fa;
+  --surface-3: #eef0f3;
+  --surface-elevated: #ffffff;
+  --sidebar: #f7f8fa;
+  --toolbar: #ffffff;
+  --overlay: rgba(16, 18, 22, 0.4);
+
+  --text: #17181c;
+  --text-secondary: #4a4c55;
+  --text-muted: #6d7079;
+  --text-faint: #9ca0a8;
+
+  --border: #dcdfe4;
+  --border-strong: #c3c7ce;
+  --border-subtle: #e7e9ed;
+  --separator: #e3e5ea;
+
+  /* Hover/active overlays are light-on-dark by default; on a light field they
+     must be dark-on-light or the states are invisible. */
+  --surface-hover: rgba(16, 18, 22, 0.055);
+  --surface-active: rgba(16, 18, 22, 0.095);
+
+  --success: #17845c;
+  --warning: #9a6a10;
+  --danger: #c23a48;
+  --info: #2b6cb0;
+
+  --tl-bg: #e8eaee;
+  --tl-ruler: #f1f2f5;
+  --tl-grid: #d7dae0;
+  --tl-grid-strong: #c2c6ce;
+  --tl-track: #f6f7f9;
+  --tl-track-alt: #eef0f3;
+  --tl-track-locked: #e4e6ea;
+
+  --clip-video: #bfd6ea;
+  --clip-video-edge: #7fa8cc;
+  --clip-audio: #bfe0cf;
+  --clip-audio-edge: #7fbd9d;
+  --clip-image: #d6cbe8;
+  --clip-image-edge: #a691cb;
+  --clip-text: #eddfc0;
+  --clip-text-edge: #c9ac6f;
+  --clip-caption: #f0d3c2;
+  --clip-caption-edge: #cf9a78;
+
+  --shadow-xs: 0 1px 2px rgba(16, 18, 22, 0.08);
+  --shadow-sm: 0 2px 6px rgba(16, 18, 22, 0.08);
+  --shadow-md: 0 8px 20px rgba(16, 18, 22, 0.1);
+  --shadow-lg: 0 18px 44px rgba(16, 18, 22, 0.14);
+  --focus-ring: 0 0 0 2px var(--surface), 0 0 0 4px var(--brand);
+}
+
+/* Compact density for smaller laptops. */
+:root[data-density='compact'] {
+  --sp-3: 10px;
+  --sp-4: 13px;
+  --sp-5: 16px;
+  --control-h: 27px;
+  --control-h-sm: 23px;
+  --panel-header-h: 34px;
+}
+
+:root[data-reduce-motion='true'] * {
+  animation-duration: 0.001ms !important;
+  transition-duration: 0.001ms !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
