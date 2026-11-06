@@ -1,0 +1,258 @@
+name: CI
+
+# Fast feedback on every branch: types, tests, build, and a real export with the
+# freshly built output. No packaging here — that is `release.yml`.
+on:
+  push:
+    branches-ignore:
+      - 'dependabot/**'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Also build the Windows installer and portable exe'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  verify:
+    name: Typecheck & tests (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install ffmpeg (the render tests encode for real)
+        run: |
+          choco install ffmpeg -y --no-progress
+          ffmpeg -version
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
+
+      - name: Build (catches import/bundling mistakes that types miss)
+        run: npm run build
+
+      # The packaged app is only useful if it can find what the user installed.
+      # These run the real search code against the runner's filesystem.
+      - name: Runtime detection smoke (whisper search + Ollama API)
+        run: npx vitest run tests/runtimes.test.ts tests/startup.test.ts
+
+      - name: Assemble a resources folder from the installed ffmpeg
+        shell: pwsh
+        run: |
+          # Mirrors the layout the installer produces (resources/ffmpeg/*.exe,
+          # resources/fonts/*.ttf) so the smoke render runs the same code path.
+          # Note: `Get-Command ffmpeg` returns Chocolatey's *shim*, which only
+          # works from its original location — copy the real binary instead.
+          New-Item -ItemType Directory -Force .smoke-res/ffmpeg, .smoke-res/fonts | Out-Null
+          function Find-RealBinary([string]$name) {
+            $direct = @("$env:ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin\$name.exe")
+            foreach ($candidate in $direct) {
+              if (Test-Path $candidate -PathType Leaf) { return (Get-Item $candidate).FullName }
+            }
+            $found = Get-ChildItem "$env:ProgramData\chocolatey\lib" -Recurse -Filter "$name.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.Length -gt 5MB } | Select-Object -First 1
+            if ($found) { return $found.FullName }
+            throw "could not locate a real $name.exe on this runner"
+          }
+          Copy-Item (Find-RealBinary 'ffmpeg') .smoke-res/ffmpeg/ffmpeg.exe
+          Copy-Item (Find-RealBinary 'ffprobe') .smoke-res/ffmpeg/ffprobe.exe
+          Copy-Item resources/fonts/*.ttf .smoke-res/fonts/
+          Get-ChildItem .smoke-res -Recurse -File | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}}
+          & .smoke-res/ffmpeg/ffmpeg.exe -hide_banner -version | Select-Object -First 1
+
+      - name: Export a real video from the build
+        id: smoke
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node scripts/smoke-render.mjs --resources .smoke-res --out $env:RUNNER_TEMP/smoke.mp4 2>&1 |
+            Tee-Object -FilePath smoke.log
+          if ($LASTEXITCODE -ne 0) { Write-Host "smoke render exited $LASTEXITCODE"; exit 1 }
+
+      # The Actions log is only visible inside GitHub's UI. When the smoke test
+      # fails, the tail is posted as a commit comment so it can be read (and
+      # linked) from anywhere, including scripts.
+      - name: Publish the smoke log on failure
+        if: steps.smoke.outcome == 'failure'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tail = if (Test-Path smoke.log) { (Get-Content smoke.log -Tail 80) -join "`n" } else { 'smoke.log was not produced' }
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $body = "Smoke render failed for ``$short``.`n`n``````n$tail`n``````"
+          $body | Set-Content smoke-body.md
+          gh api -X POST "repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA/comments" -F body=@smoke-body.md
+          exit 1
+
+  # Runs when a commit asks for it (`[package]` in the message) or by hand.
+  # Once this branch is merged, `release.yml` becomes the canonical build
+  # (tag-driven, publishes a GitHub Release); GitHub only registers workflows
+  # that exist on the default branch, so the packaging steps live here too until
+  # then.
+  package:
+    name: Package installer & portable
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.package) ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, '[package]'))
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install ffmpeg (fallback source for the bundled binaries)
+        run: |
+          choco install ffmpeg -y --no-progress
+          ffmpeg -version
+
+      - name: Fetch ffmpeg + whisper.cpp binaries
+        id: binaries
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node scripts/fetch-binaries.mjs 2>&1 | Tee-Object -FilePath binaries.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Report a binary fetch failure
+        if: steps.binaries.outcome == 'failure'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tail = if (Test-Path binaries.log) { (Get-Content binaries.log -Tail 60) -join "`n" } else { 'no log' }
+          "Binary fetch failed for ``$($env:GITHUB_SHA.Substring(0,7))``.`n`n``````n$tail`n``````" | Set-Content body.md
+          gh api -X POST "repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA/comments" -F body=@body.md
+          exit 1
+
+      - name: Generate icons from the logo
+        run: node scripts/make-icons.mjs
+
+      - name: Build
+        run: npm run build
+
+      - name: Package (NSIS installer + portable exe)
+        run: npx electron-builder --win --x64 --publish never --config electron-builder.config.cjs
+
+      - name: Verify assembly (asar + binaries + fonts)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'release/win-unpacked/resources/app.asar')) { throw 'app.asar is missing' }
+          $listing = npx asar list release/win-unpacked/resources/app.asar
+          foreach ($required in @('out\main\index.js', 'out\preload\index.js', 'out\renderer\index.html')) {
+            if (-not ($listing -match [regex]::Escape($required))) { throw "$required is not inside app.asar" }
+          }
+          if (-not ($listing -match 'node_modules\\fflate')) { throw 'fflate was not packaged' }
+          foreach ($exe in @('ffmpeg.exe', 'ffprobe.exe')) {
+            $path = "release/win-unpacked/resources/ffmpeg/$exe"
+            if (-not (Test-Path $path)) { throw "$exe was not bundled" }
+            & $path -hide_banner -version | Select-Object -First 1
+          }
+          Write-Host "$((Get-ChildItem release/win-unpacked/resources/fonts -Filter *.ttf).Count) bundled fonts"
+
+      - name: Smoke-test the packaged app (boot + real export)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. Boot the actual exe and prove the *UI rendered* (not merely that the
+          #    document loaded — a blank window passes that weaker check).
+          $env:CLIPWRIGHT_SMOKE = '1'
+          $proc = Start-Process -FilePath 'release/win-unpacked/Clipwright Studio.exe' -PassThru
+          if (-not $proc.WaitForExit(180000)) { $proc.Kill(); throw 'the packaged app never finished loading' }
+          $proc.Refresh()
+          $code = $proc.ExitCode
+          Remove-Item Env:CLIPWRIGHT_SMOKE
+          Get-Process | Where-Object { $_.ProcessName -like '*Clipwright*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          # The app writes its own diagnostics; print them so a failure is legible
+          # in the Actions log *and* in a commit comment.
+          $logFile = Get-ChildItem "$env:APPDATA\Clipwright Studio" -Recurse -Filter 'clipwright.log' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $lines = @()
+          if ($logFile) {
+            $lines = Get-Content $logFile.FullName -Tail 60
+            $lines | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) {
+              $body = "Packaged app failed to start on Windows (exit $code).`n`n``````n$($lines -join "`n")`n``````"
+              $body | Set-Content boot-body.md
+              gh api -X POST "repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA/comments" -F body=@boot-body.md
+            }
+          } else {
+            Write-Host 'no clipwright.log was produced by the app'
+          }
+          if ($code -ne 0) { throw "packaged app failed to start (exit code $code)" }
+          Write-Host 'packaged app booted and rendered its UI'
+
+          # 2. Render a real video through the real compositor with the bundled ffmpeg.
+          node scripts/smoke-render.mjs --resources release/win-unpacked/resources --out $env:RUNNER_TEMP/smoke.mp4
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem release -File | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}} | Format-Table -AutoSize
+          $files = Get-ChildItem release -File | Where-Object { $_.Extension -in '.exe','.blockmap','.yml' }
+          $files | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content release/checksums.txt
+          Get-Content release/checksums.txt
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipwright-windows-x64
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/*.yml
+            release/checksums.txt
+          if-no-files-found: error
+
+      - name: Publish a downloadable build
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[package]')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A pre-release, so the in-app updater (which reads "latest" releases)
+          # ignores test builds and real versions stay in control of release.yml.
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $tag = "build-$short"
+          $notes = @"
+          Automated Windows x64 build of commit $($env:GITHUB_SHA).
+
+          Assets:
+          - ``Clipwright-Studio-Setup-1.0.0-x64.exe`` — per-user installer (no admin prompt)
+          - ``Clipwright-Studio-Portable-1.0.0-x64.exe`` — single file, no install
+          - ``checksums.txt`` — SHA-256 for each file
+
+          This build is unsigned, so Windows SmartScreen will warn on first run: choose
+          "More info" → "Run anyway", and compare the hash against checksums.txt first.
+          "@
+          $notes | Set-Content release/notes.md
+          # Only ship what a user downloads; the release body carries the notes.
+          $assets = @(Get-ChildItem release -File | Where-Object { $_.Name -match 'Setup|Portable|checksums\.txt|\.blockmap$|latest\.yml' } | ForEach-Object { $_.FullName })
+          gh release create $tag --target $env:GITHUB_SHA --prerelease --title "Clipwright Studio (build $short)" --notes-file release/notes.md @assets
+          Write-Host "released $tag"
+

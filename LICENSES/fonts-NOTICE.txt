@@ -1,0 +1,17 @@
+Bundled fonts
+=============
+
+Clipwright Studio bundles these families so caption styles render identically in
+the preview and in exported video, without network access:
+
+  Inter              SIL Open Font License 1.1
+  Montserrat         SIL Open Font License 1.1
+  Poppins            SIL Open Font License 1.1
+  Oswald             SIL Open Font License 1.1
+  Anton              SIL Open Font License 1.1
+  Bebas Neue         SIL Open Font License 1.1
+  Playfair Display   SIL Open Font License 1.1
+  JetBrains Mono     SIL Open Font License 1.1
+
+The full OFL text is available at https://openfontlicense.org. Each family is
+included unmodified.
